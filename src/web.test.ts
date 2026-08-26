@@ -1,0 +1,166 @@
+import { describe, it, expect } from 'vitest';
+import crypto from 'crypto';
+import { validateRedirectUri, verifySsoCode, encodeState, decodeState } from './web';
+import {
+  availableLoginMethods,
+  isSuperAdmin,
+  parseMicrosoftIdToken,
+  getProvider,
+} from './providers';
+import type { Settings } from './settings';
+
+const settings: Settings = { PARENT_DOMAIN: 'wisp.net' };
+
+describe('validateRedirectUri', () => {
+  it('accepts any https app under the parent domain', () => {
+    expect(validateRedirectUri('https://echo.wisp.net/auth/callback', settings)).toBe(
+      'https://echo.wisp.net/auth/callback'
+    );
+    expect(validateRedirectUri('https://aida.wisp.net/cb', settings)).toBe(
+      'https://aida.wisp.net/cb'
+    );
+    expect(validateRedirectUri('https://wisp.net/cb', settings)).toBe('https://wisp.net/cb');
+  });
+
+  it('rejects hosts outside the parent domain, including suffix tricks', () => {
+    expect(validateRedirectUri('https://evil.com/cb', settings)).toBeNull();
+    expect(validateRedirectUri('https://notwisp.net/cb', settings)).toBeNull();
+    expect(validateRedirectUri('https://wisp.net.evil.com/cb', settings)).toBeNull();
+  });
+
+  it('rejects http in production but allows it in development', () => {
+    expect(validateRedirectUri('http://echo.wisp.net/cb', settings)).toBeNull();
+    expect(validateRedirectUri('http://echo.wisp.net/cb', settings, 'development')).toBe(
+      'http://echo.wisp.net/cb'
+    );
+  });
+
+  it('rejects everything until PARENT_DOMAIN is configured', () => {
+    expect(validateRedirectUri('https://echo.wisp.net/cb', {})).toBeNull();
+  });
+
+  it('rejects malformed URLs and embedded credentials', () => {
+    expect(validateRedirectUri('not a url', settings)).toBeNull();
+    expect(validateRedirectUri('https://user:pass@echo.wisp.net/cb', settings)).toBeNull();
+  });
+});
+
+describe('verifySsoCode', () => {
+  const secret = 'shh';
+  function makeCode(payload: Record<string, unknown>): { code: string; sig: string } {
+    const code = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig = crypto.createHmac('sha256', secret).update(code).digest('hex');
+    return { code, sig };
+  }
+
+  it('accepts a properly signed, unexpired code', () => {
+    const { code, sig } = makeCode({
+      clientId: '42',
+      nonce: 'n'.repeat(32),
+      exp: Math.floor(Date.now() / 1000) + 30,
+    });
+    expect(verifySsoCode(secret, code, sig)?.clientId).toBe('42');
+  });
+
+  it('rejects a tampered signature', () => {
+    const { code } = makeCode({
+      clientId: '42',
+      nonce: 'n'.repeat(32),
+      exp: Math.floor(Date.now() / 1000) + 30,
+    });
+    expect(verifySsoCode(secret, code, 'ab'.repeat(32))).toBeNull();
+  });
+
+  it('rejects an expired code', () => {
+    const { code, sig } = makeCode({
+      clientId: '42',
+      nonce: 'n'.repeat(32),
+      exp: Math.floor(Date.now() / 1000) - 5,
+    });
+    expect(verifySsoCode(secret, code, sig)).toBeNull();
+  });
+});
+
+describe('availableLoginMethods', () => {
+  it('offers nothing when nothing is configured', () => {
+    expect(availableLoginMethods({})).toEqual([]);
+  });
+
+  it('offers a provider only when every required key is set', () => {
+    expect(availableLoginMethods({ GOOGLE_CLIENT_ID: 'x' }).map((m) => m.id)).toEqual([]);
+    expect(
+      availableLoginMethods({ GOOGLE_CLIENT_ID: 'x', GOOGLE_CLIENT_SECRET: 'y' }).map((m) => m.id)
+    ).toEqual(['google']);
+  });
+
+  it('offers the ISP bridge when both plugin URL and secret exist', () => {
+    const methods = availableLoginMethods({
+      UISP_PLUGIN_URL: 'https://my.wisp.net/plugin',
+      UISP_SSO_SECRET: 's',
+    });
+    expect(methods).toEqual([
+      { id: 'uisp', label: 'ISP account', href: 'https://my.wisp.net/plugin', kind: 'external' },
+    ]);
+  });
+});
+
+describe('isSuperAdmin', () => {
+  const google = getProvider('google')!;
+  const microsoft = getProvider('microsoft')!;
+
+  it('grants for a Google account on the parent domain', () => {
+    expect(
+      isSuperAdmin(google, { sub: 's', email: 'a@wisp.net', name: 'A' }, settings)
+    ).toBe(true);
+    expect(
+      isSuperAdmin(google, { sub: 's', email: 'x@gmail.com', name: 'A', hd: 'wisp.net' }, settings)
+    ).toBe(true);
+  });
+
+  it('never grants via a provider that does not verify the domain', () => {
+    expect(
+      isSuperAdmin(microsoft, { sub: 's', email: 'a@wisp.net', name: 'A' }, settings)
+    ).toBe(false);
+  });
+
+  it('honours SUPERADMIN_DOMAIN over PARENT_DOMAIN', () => {
+    const s: Settings = { PARENT_DOMAIN: 'wisp.net', SUPERADMIN_DOMAIN: 'corp.example' };
+    expect(isSuperAdmin(google, { sub: 's', email: 'a@wisp.net', name: 'A' }, s)).toBe(false);
+    expect(isSuperAdmin(google, { sub: 's', email: 'a@corp.example', name: 'A' }, s)).toBe(true);
+  });
+
+  it('grants nothing when no domain is configured', () => {
+    expect(isSuperAdmin(google, { sub: 's', email: 'a@wisp.net', name: 'A' }, {})).toBe(false);
+  });
+});
+
+describe('parseMicrosoftIdToken', () => {
+  function idToken(claims: Record<string, unknown>): string {
+    const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    return `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64(claims)}.signature`;
+  }
+
+  it('reads a work/school account and lowercases the address', () => {
+    const info = parseMicrosoftIdToken(
+      idToken({ sub: 'sub-123', name: 'Ada', email: 'Ada@Contoso.COM' })
+    );
+    expect(info).toEqual({ sub: 'sub-123', email: 'ada@contoso.com', name: 'Ada' });
+  });
+
+  it('rejects a token with no usable address or subject', () => {
+    expect(parseMicrosoftIdToken(idToken({ sub: 's', name: 'No Mail' }))).toBeNull();
+    expect(parseMicrosoftIdToken(idToken({ email: 'a@b.c' }))).toBeNull();
+    expect(parseMicrosoftIdToken('not-a-jwt')).toBeNull();
+  });
+});
+
+describe('state round trip', () => {
+  it('encodes and decodes', () => {
+    const state = { csrf: 'c', context: 'login' as const, provider: 'google' };
+    expect(decodeState(encodeState(state))).toEqual(state);
+  });
+
+  it('returns null on garbage', () => {
+    expect(decodeState('!!!')).toBeNull();
+  });
+});

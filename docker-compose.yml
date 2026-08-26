@@ -1,0 +1,17 @@
+# Standalone dev — for the full stack use EchoOrchestrator instead.
+services:
+  id-web:
+    build: .
+    container_name: id-web
+    environment:
+      PORT: "3200"
+      DB_HOST: ${DB_HOST:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-13306}
+      DB_USER: ${DB_USER:-echo_app}
+      DB_PASSWORD: ${DB_PASSWORD:-devpass}
+      DB_NAME: ${DB_NAME:-id_db}
+      NOCODB_BASE_URL: ${NOCODB_BASE_URL:-http://host.docker.internal:18090}
+      NOCODB_API_TOKEN: ${NOCODB_API_TOKEN:-}
+    ports:
+      - "127.0.0.1:3200:3200"
+    restart: unless-stopped
