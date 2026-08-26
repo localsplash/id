@@ -332,3 +332,185 @@ export async function adminListUsers(pool: mysql.Pool): Promise<AdminUserView[]>
   }
   return Array.from(users.values());
 }
+
+// ─── Application registry ─────────────────────────────────────────────────────
+
+export interface AppRow {
+  sOrigin: string;
+  sName: string | null;
+  sWebhookUrl: string | null;
+  dtDiscovered: string;
+  dtRegistered: string | null;
+  dtLastTokenExchange: string | null;
+  dtLastDeliveryOk: string | null;
+  dtLastDeliveryFail: string | null;
+  sLastError: string | null;
+  iConsecutiveFailures: number;
+}
+
+/**
+ * Note an application exists because it just redeemed a handoff code.
+ *
+ * This is the discovery half of the registry: an app that integrates login
+ * but never registers a webhook still shows up, which is precisely the
+ * misconfiguration the dashboard needs to be able to name.
+ */
+export async function recordAppOrigin(pool: mysql.Pool, origin: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO id_tbl_App (sOrigin, dtLastTokenExchange) VALUES (?, NOW(3))
+     ON DUPLICATE KEY UPDATE dtLastTokenExchange = NOW(3)`,
+    [origin]
+  );
+}
+
+/**
+ * Register (or re-register) an app's webhook endpoint, returning the secret
+ * it must verify deliveries with. The secret is minted once and returned on
+ * every registration, so an app can hold it in memory and re-fetch it on
+ * boot instead of carrying yet another configured value.
+ */
+export async function registerApp(
+  pool: mysql.Pool,
+  params: { origin: string; name: string | null; webhookUrl: string }
+): Promise<{ secret: string; rotated: boolean }> {
+  const [existing] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT sSecret FROM id_tbl_App WHERE sOrigin = ?`,
+    [params.origin]
+  );
+  const current = existing.length ? (existing[0].sSecret as string | null) : null;
+  const secret = current ?? generateId(32);
+
+  await pool.query(
+    `INSERT INTO id_tbl_App (sOrigin, sName, sWebhookUrl, sSecret, dtRegistered)
+     VALUES (?, ?, ?, ?, NOW(3))
+     ON DUPLICATE KEY UPDATE
+       sName = VALUES(sName),
+       sWebhookUrl = VALUES(sWebhookUrl),
+       sSecret = COALESCE(sSecret, VALUES(sSecret)),
+       dtRegistered = NOW(3),
+       iConsecutiveFailures = 0,
+       sLastError = NULL`,
+    [params.origin, params.name, params.webhookUrl, secret]
+  );
+  return { secret, rotated: current === null };
+}
+
+export async function listApps(pool: mysql.Pool): Promise<AppRow[]> {
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT sOrigin, sName, sWebhookUrl, dtDiscovered, dtRegistered, dtLastTokenExchange,
+            dtLastDeliveryOk, dtLastDeliveryFail, sLastError, iConsecutiveFailures
+       FROM id_tbl_App ORDER BY sOrigin`
+  );
+  return rows as unknown as AppRow[];
+}
+
+export async function getAppSecret(pool: mysql.Pool, origin: string): Promise<string | null> {
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT sSecret FROM id_tbl_App WHERE sOrigin = ?`,
+    [origin]
+  );
+  return rows.length ? ((rows[0].sSecret as string) ?? null) : null;
+}
+
+/** Pending (undelivered, unabandoned) deliveries per app, for the dashboard. */
+export async function pendingDeliveryCounts(
+  pool: mysql.Pool
+): Promise<Record<string, { pending: number; abandoned: number }>> {
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT sOrigin,
+            SUM(dtDelivered IS NULL AND dtAbandoned IS NULL) AS pending,
+            SUM(dtAbandoned IS NOT NULL) AS abandoned
+       FROM id_tbl_Delivery GROUP BY sOrigin`
+  );
+  const out: Record<string, { pending: number; abandoned: number }> = {};
+  for (const r of rows) {
+    out[r.sOrigin as string] = {
+      pending: Number(r.pending ?? 0),
+      abandoned: Number(r.abandoned ?? 0),
+    };
+  }
+  return out;
+}
+
+/** Events after `since`, oldest first — the boot-time catch-up feed. */
+export async function listEventsSince(
+  pool: mysql.Pool,
+  since: number,
+  limit = 200
+): Promise<Array<{ id: number; type: string; occurredAt: string; data: unknown }>> {
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT iEventId, sType, jsonData, dtCreated
+       FROM id_tbl_Event WHERE iEventId > ? ORDER BY iEventId ASC LIMIT ?`,
+    [since, limit]
+  );
+  return rows.map((r) => ({
+    id: r.iEventId as number,
+    type: r.sType as string,
+    occurredAt: new Date(r.dtCreated as string).toISOString(),
+    data: typeof r.jsonData === 'string' ? JSON.parse(r.jsonData) : r.jsonData,
+  }));
+}
+
+// ─── Identity remapping ───────────────────────────────────────────────────────
+
+export interface MergeResult {
+  movedIdentities: number;
+  revokedSessions: number;
+}
+
+/**
+ * Fold one id user into another: every login method on `fromUserId` becomes
+ * a login method of `toUserId`, and the retired user's sessions end.
+ *
+ * This is the repair for the two ways a person ends up as two users — they
+ * signed in with Google having previously come through the ISP bridge, or a
+ * provider that does not vouch for its addresses could not be auto-linked.
+ * An identity already present on the target is dropped rather than
+ * duplicated (the unique key on (provider, subject) would refuse it anyway).
+ */
+export async function mergeUsers(
+  pool: mysql.Pool,
+  fromUserId: number,
+  toUserId: number
+): Promise<MergeResult> {
+  if (fromUserId === toUserId) throw new Error('Cannot merge a user into itself');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [moved] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE IGNORE id_tbl_Identity SET iUserId = ? WHERE iUserId = ?`,
+      [toUserId, fromUserId]
+    );
+    // Whatever IGNORE skipped was a duplicate of an identity the target
+    // already holds; the source row is redundant either way.
+    await conn.query(`DELETE FROM id_tbl_Identity WHERE iUserId = ?`, [fromUserId]);
+
+    const [revoked] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE id_tbl_Session SET dtRevoked = NOW(3)
+        WHERE iUserId = ? AND dtRevoked IS NULL`,
+      [fromUserId]
+    );
+
+    // Keep an address on the surviving user if it had none.
+    await conn.query(
+      `UPDATE id_tbl_User t
+          JOIN id_tbl_User f ON f.iUserId = ?
+          SET t.email = COALESCE(t.email, f.email),
+              t.displayName = COALESCE(t.displayName, f.displayName)
+        WHERE t.iUserId = ?`,
+      [fromUserId, toUserId]
+    );
+
+    await conn.query(`DELETE FROM id_tbl_User WHERE iUserId = ?`, [fromUserId]);
+    await conn.commit();
+
+    return { movedIdentities: moved.affectedRows, revokedSessions: revoked.affectedRows };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}

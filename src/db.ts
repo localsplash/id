@@ -82,6 +82,58 @@ export async function ensureSchema(pool: mysql.Pool): Promise<void> {
         FOREIGN KEY (iUserId) REFERENCES id_tbl_User(iUserId) ON DELETE CASCADE
     ) ENGINE=InnoDB
   `);
+  // Applications under the parent domain.
+  //
+  // A row appears one of two ways: the app self-registers its webhook
+  // endpoint (dtRegistered set), or id notices it redeeming handoff codes
+  // and records the origin on its own (dtDiscovered only). The second is
+  // what lets the dashboard say "this app is live but is not listening for
+  // revocations" without anyone having to maintain a list by hand.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS id_tbl_App (
+      sOrigin              VARCHAR(255) PRIMARY KEY,
+      sName                VARCHAR(128) NULL,
+      sWebhookUrl          VARCHAR(1024) NULL,
+      sSecret              CHAR(64) NULL,
+      dtDiscovered         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      dtRegistered         DATETIME(3) NULL,
+      dtLastTokenExchange  DATETIME(3) NULL,
+      dtLastDeliveryOk     DATETIME(3) NULL,
+      dtLastDeliveryFail   DATETIME(3) NULL,
+      sLastError           VARCHAR(512) NULL,
+      iConsecutiveFailures INT NOT NULL DEFAULT 0
+    ) ENGINE=InnoDB
+  `);
+  // Events are durable and ordered: an app that was down catches up from
+  // iEventId on its next boot rather than silently missing a revocation.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS id_tbl_Event (
+      iEventId  BIGINT AUTO_INCREMENT PRIMARY KEY,
+      sType     VARCHAR(64) NOT NULL,
+      jsonData  JSON NOT NULL,
+      dtCreated DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      INDEX idx_event_created (dtCreated)
+    ) ENGINE=InnoDB
+  `);
+  // One delivery row per (event, app), retried with backoff by the ticker in
+  // server.ts. Durable so a restart mid-retry does not drop the event.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS id_tbl_Delivery (
+      iDeliveryId   BIGINT AUTO_INCREMENT PRIMARY KEY,
+      iEventId      BIGINT NOT NULL,
+      sOrigin       VARCHAR(255) NOT NULL,
+      iAttempts     INT NOT NULL DEFAULT 0,
+      dtNextAttempt DATETIME(3) NULL,
+      dtDelivered   DATETIME(3) NULL,
+      dtAbandoned   DATETIME(3) NULL,
+      sLastError    VARCHAR(512) NULL,
+      dtCreated     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      UNIQUE INDEX uq_event_app (iEventId, sOrigin),
+      INDEX idx_delivery_due (dtNextAttempt),
+      CONSTRAINT fk_delivery_event
+        FOREIGN KEY (iEventId) REFERENCES id_tbl_Event(iEventId) ON DELETE CASCADE
+    ) ENGINE=InnoDB
+  `);
   // Single-use nonces from the UISP bridge (replay guard).
   await pool.query(`
     CREATE TABLE IF NOT EXISTS id_tbl_SsoNonce (

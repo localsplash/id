@@ -16,6 +16,20 @@ export const AUTHREQ_COOKIE = 'id_authreq';
 // must have some lifetime); validity is decided server-side by dtRevoked.
 const SESSION_COOKIE_MAX_AGE = 10 * 365 * 24 * 3600;
 
+/**
+ * Constant-time comparison for shared secrets.
+ *
+ * `!==` returns as soon as two bytes differ, which leaks how much of the
+ * secret a caller got right. Hashing both sides first means differing
+ * lengths neither throw nor leak, and the comparison itself is fixed-time.
+ */
+export function secretsMatch(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const ha = crypto.createHash('sha256').update(a).digest();
+  const hb = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
 // ─── Redirect validation ──────────────────────────────────────────────────────
 
 /**

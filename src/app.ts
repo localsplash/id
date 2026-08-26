@@ -32,6 +32,7 @@ import {
   getAuthRequestFromCookie,
   validateRedirectUri,
   verifySsoCode,
+  secretsMatch,
   SetupRequest,
   setSetupCookie,
   clearSetupCookie,
@@ -41,6 +42,7 @@ import {
   isValidDomainList,
 } from './web';
 import * as store from './store';
+import { emitEvent, FAILING_THRESHOLD, EVENT_TYPES } from './webhooks';
 
 const publicDir = path.join(__dirname, '..', 'public');
 
@@ -642,6 +644,11 @@ export function buildApp() {
           userInfo.email,
           linkSession.iUserId,
         ]);
+        await emitEvent(db, 'identity.linked', {
+          iUserId: linkSession.iUserId,
+          provider: provider.id,
+          subject: userInfo.sub,
+        });
         return res.redirect(`/account?linked=${provider.id}`);
       }
 
@@ -753,7 +760,7 @@ export function buildApp() {
       if (!settings.ID_CLIENT_SECRET) {
         return res.status(503).json({ error: 'ID_CLIENT_SECRET is not configured' });
       }
-      if (!client_secret || client_secret !== settings.ID_CLIENT_SECRET) {
+      if (!secretsMatch(client_secret, settings.ID_CLIENT_SECRET)) {
         return res.status(401).json({ error: 'Invalid client secret' });
       }
       if (!code || !redirect_uri) {
@@ -762,6 +769,15 @@ export function buildApp() {
 
       const consumed = await store.consumeAuthCode(db, code, redirect_uri);
       if (!consumed) return res.status(400).json({ error: 'Invalid, expired, or reused code' });
+
+      // The app just proved it is live. Record it whether or not it has
+      // registered a webhook — an app that logs users in but never listens
+      // for revocations is exactly what the dashboard needs to surface.
+      try {
+        await store.recordAppOrigin(db, new URL(redirect_uri).origin);
+      } catch (err) {
+        logger.warn({ err }, '[apps] could not record calling app origin');
+      }
 
       const user = await store.getUser(db, consumed.iUserId);
       if (!user) return res.status(400).json({ error: 'Unknown user' });
@@ -781,6 +797,107 @@ export function buildApp() {
           email: i.email,
         })),
       });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Application integration (the webhook standard) ─────────────────────────
+
+  /**
+   * Applications authenticate to these with the same ID_CLIENT_SECRET they
+   * use for the token exchange — it is the shared "you are one of ours"
+   * credential, and every app under the domain already reads it from
+   * oAuthConfig.
+   */
+  async function requireAppSecret(
+    req: express.Request,
+    res: express.Response
+  ): Promise<Settings | null> {
+    const settings = await getSettings();
+    if (!settings.ID_CLIENT_SECRET) {
+      res.status(503).json({ error: 'ID_CLIENT_SECRET is not configured' });
+      return null;
+    }
+    const presented = String(
+      (req.body as Record<string, string> | undefined)?.client_secret ??
+        req.get('X-Id-Client-Secret') ??
+        ''
+    );
+    if (!secretsMatch(presented, settings.ID_CLIENT_SECRET)) {
+      res.status(401).json({ error: 'Invalid client secret' });
+      return null;
+    }
+    return settings;
+  }
+
+  /**
+   * POST /api/apps/register { client_secret, name, webhook_url }
+   *
+   * Called by every app on boot. Returns the secret that signs deliveries to
+   * it, so the app holds one less configured value: its integration is
+   * established by running, not by an admin remembering to add a row.
+   */
+  app.post('/api/apps/register', async (req, res, next) => {
+    try {
+      const settings = await requireAppSecret(req, res);
+      if (!settings) return;
+
+      const body = (req.body ?? {}) as Record<string, string>;
+      const webhookUrl = validateRedirectUri(
+        String(body.webhook_url ?? ''),
+        settings,
+        config.NODE_ENV
+      );
+      if (!webhookUrl) {
+        return res.status(400).json({
+          error:
+            'webhook_url must be an https URL under the configured parent domain.',
+        });
+      }
+      const name = String(body.name ?? '').trim().slice(0, 128) || null;
+      const origin = new URL(webhookUrl).origin;
+
+      const { secret } = await store.registerApp(db, { origin, name, webhookUrl });
+      logger.info(`[apps] registered ${origin} → ${webhookUrl}`);
+
+      // Prove the endpoint is reachable straight away rather than leaving the
+      // first real revocation to discover it is not.
+      await emitEvent(db, 'ping', { origin }, { onlyOrigin: origin });
+
+      return res.json({
+        ok: true,
+        origin,
+        secret,
+        events: EVENT_TYPES,
+        signature: {
+          header: 'X-Id-Signature',
+          scheme: 'sha256=HMAC_SHA256(secret, `${X-Id-Timestamp}.${rawBody}`)',
+          toleranceSeconds: 300,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * GET /api/events?since=<eventId> — the boot-time catch-up.
+   *
+   * A webhook that failed while an app was down is retried, but an app that
+   * was down for longer than the retry schedule would still have a hole.
+   * Reading forward from the last event it processed closes it, and means an
+   * app never needs a timer of its own.
+   */
+  app.get('/api/events', async (req, res, next) => {
+    try {
+      if (!(await requireAppSecret(req, res))) return;
+      const since = Number(req.query.since ?? 0);
+      if (!Number.isFinite(since) || since < 0) {
+        return res.status(400).json({ error: 'since must be a non-negative event id' });
+      }
+      const items = await store.listEventsSince(db, since);
+      return res.json({ items });
     } catch (err) {
       next(err);
     }
@@ -838,6 +955,11 @@ export function buildApp() {
         });
       }
       await store.deleteIdentity(db, id);
+      await emitEvent(db, 'identity.unlinked', {
+        iUserId: session.iUserId,
+        provider: identity.provider,
+        subject: identity.subject,
+      });
       return res.json({ ok: true });
     } catch (err) {
       next(err);
@@ -851,7 +973,16 @@ export function buildApp() {
     try {
       const settings = await getSettings();
       const session = await resolveSession(req);
-      if (session) await store.revokeSession(db, session.sSessionId);
+      if (session) {
+        await store.revokeSession(db, session.sSessionId);
+        // The app sessions this login spawned are independent of ours, so
+        // signing out here only means anything if the apps hear about it.
+        await emitEvent(db, 'session.revoked', {
+          iUserId: session.iUserId,
+          scope: 'one',
+          sessionId: session.sSessionId,
+        });
+      }
       clearSessionCookie(res, settings);
       return res.redirect('/');
     } catch (err) {
@@ -868,6 +999,7 @@ export function buildApp() {
       const session = await resolveSession(req);
       if (!session) return res.status(401).json({ error: 'Not logged in' });
       const n = await store.revokeAllSessions(db, session.iUserId);
+      await emitEvent(db, 'session.revoked', { iUserId: session.iUserId, scope: 'all' });
       clearSessionCookie(res, settings);
       return res.json({ ok: true, revoked: n });
     } catch (err) {
@@ -949,8 +1081,95 @@ export function buildApp() {
       if (!session) return;
       const iUserId = Number(req.params.id);
       const n = await store.revokeAllSessions(db, iUserId);
+      await emitEvent(db, 'session.revoked', { iUserId, scope: 'all' });
       logger.warn(`[admin] user ${session.iUserId} revoked ${n} session(s) of user ${iUserId}`);
       return res.json({ ok: true, revoked: n });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * Integration health. Status is derived here rather than in the page so
+   * every consumer agrees on what "not listening" means:
+   *
+   *   not_integrated — redeems logins but never registered a webhook
+   *   failing        — registered, but deliveries are erroring
+   *   unverified     — registered, nothing delivered successfully yet
+   *   listening      — registered and delivering
+   */
+  app.get('/api/admin/apps', async (req, res, next) => {
+    try {
+      if (!(await requireSuperAdmin(req, res))) return;
+      const [apps, counts] = await Promise.all([
+        store.listApps(db),
+        store.pendingDeliveryCounts(db),
+      ]);
+      const items = apps.map((a) => {
+        const c = counts[a.sOrigin] ?? { pending: 0, abandoned: 0 };
+        let status: 'listening' | 'failing' | 'unverified' | 'not_integrated';
+        if (!a.sWebhookUrl) status = 'not_integrated';
+        else if (c.abandoned > 0 || a.iConsecutiveFailures >= FAILING_THRESHOLD) status = 'failing';
+        else if (!a.dtLastDeliveryOk) status = 'unverified';
+        else status = 'listening';
+        return { ...a, status, pending: c.pending, abandoned: c.abandoned };
+      });
+      return res.json({ items, eventTypes: EVENT_TYPES });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Re-test an endpoint on demand — the "is it me or them" button. */
+  app.post('/api/admin/apps/ping', async (req, res, next) => {
+    try {
+      const session = await requireSuperAdmin(req, res);
+      if (!session) return;
+      const origin = String((req.body ?? {}).origin ?? '');
+      const secret = await store.getAppSecret(db, origin);
+      if (!secret) {
+        return res.status(400).json({ error: 'That app has not registered a webhook yet.' });
+      }
+      await emitEvent(db, 'ping', { origin }, { onlyOrigin: origin });
+      return res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * Fold one id user into another. The apps are told so they can repoint
+   * their own mapping — otherwise the retired id user would linger in every
+   * app that had seen it.
+   */
+  app.post('/api/admin/users/:id/merge', async (req, res, next) => {
+    try {
+      const session = await requireSuperAdmin(req, res);
+      if (!session) return;
+      const fromUserId = Number(req.params.id);
+      const toUserId = Number((req.body ?? {}).intoUserId);
+      if (!Number.isInteger(fromUserId) || !Number.isInteger(toUserId)) {
+        return res.status(400).json({ error: 'Both user ids are required.' });
+      }
+      if (fromUserId === toUserId) {
+        return res.status(400).json({ error: 'Cannot merge a user into itself.' });
+      }
+      const [from, to] = await Promise.all([
+        store.getUser(db, fromUserId),
+        store.getUser(db, toUserId),
+      ]);
+      if (!from || !to) return res.status(404).json({ error: 'Unknown user.' });
+
+      const result = await store.mergeUsers(db, fromUserId, toUserId);
+      await emitEvent(db, 'user.merged', { fromUserId, toUserId });
+      // The retired user's sessions ended as part of the merge; apps need
+      // that as its own signal since they key sessions on the id user.
+      await emitEvent(db, 'session.revoked', { iUserId: fromUserId, scope: 'all' });
+      logger.warn(
+        `[admin] user ${session.iUserId} merged id user ${fromUserId} into ${toUserId} ` +
+          `(${result.movedIdentities} identities moved, ${result.revokedSessions} sessions revoked)`
+      );
+      return res.json({ ok: true, ...result });
     } catch (err) {
       next(err);
     }
@@ -970,6 +1189,11 @@ export function buildApp() {
         });
       }
       await store.deleteIdentity(db, id);
+      await emitEvent(db, 'identity.unlinked', {
+        iUserId: identity.iUserId,
+        provider: identity.provider,
+        subject: identity.subject,
+      });
       logger.warn(
         `[admin] user ${session.iUserId} unlinked identity ${id} (${identity.provider}) from user ${identity.iUserId}`
       );

@@ -8,6 +8,7 @@ import {
   suggestParentDomain,
   isValidDomain,
   isValidDomainList,
+  secretsMatch,
 } from './web';
 import {
   availableLoginMethods,
@@ -20,6 +21,7 @@ import {
   getProvider,
 } from './providers';
 import type { Settings } from './settings';
+import { signPayload, verifySignature } from './webhooks';
 
 const settings: Settings = { PARENT_DOMAIN: 'wisp.net' };
 
@@ -314,5 +316,72 @@ describe('state round trip', () => {
 
   it('returns null on garbage', () => {
     expect(decodeState('!!!')).toBeNull();
+  });
+});
+
+describe('webhook signing (the integration contract)', () => {
+  const secret = 'app-secret';
+  const body = JSON.stringify({ id: 1, type: 'ping', data: {} });
+  const now = 1_774_500_000;
+
+  it('accepts a signature the documented formula produces', () => {
+    const sig = `sha256=${signPayload(secret, now, body)}`;
+    expect(verifySignature(secret, now, body, sig, now)).toBe(true);
+  });
+
+  it('accepts the bare hex form too', () => {
+    const sig = signPayload(secret, now, body);
+    expect(verifySignature(secret, now, body, sig, now)).toBe(true);
+  });
+
+  it('rejects a body altered in transit', () => {
+    const sig = `sha256=${signPayload(secret, now, body)}`;
+    expect(verifySignature(secret, now, body + ' ', sig, now)).toBe(false);
+  });
+
+  it('rejects the wrong secret', () => {
+    const sig = `sha256=${signPayload('other', now, body)}`;
+    expect(verifySignature(secret, now, body, sig, now)).toBe(false);
+  });
+
+  // The timestamp is signed alongside the body precisely so a captured
+  // delivery cannot be replayed later.
+  it('rejects a stale or future timestamp beyond tolerance', () => {
+    const sig = `sha256=${signPayload(secret, now, body)}`;
+    expect(verifySignature(secret, now, body, sig, now + 301)).toBe(false);
+    expect(verifySignature(secret, now, body, sig, now - 301)).toBe(false);
+    expect(verifySignature(secret, now, body, sig, now + 299)).toBe(true);
+  });
+
+  it('rejects a replayed body under a fresh timestamp', () => {
+    // Signature was minted for `now`; presenting it with a later timestamp
+    // fails because the timestamp is inside the MAC.
+    const sig = `sha256=${signPayload(secret, now, body)}`;
+    expect(verifySignature(secret, now + 60, body, sig, now + 60)).toBe(false);
+  });
+
+  it('rejects missing or malformed signatures rather than throwing', () => {
+    expect(verifySignature(secret, now, body, '', now)).toBe(false);
+    expect(verifySignature(secret, now, body, 'sha256=zzzz', now)).toBe(false);
+    expect(verifySignature('', now, body, 'sha256=aa', now)).toBe(false);
+  });
+});
+
+describe('secretsMatch', () => {
+  it('accepts an exact match and rejects anything else', () => {
+    expect(secretsMatch('s3cret', 's3cret')).toBe(true);
+    expect(secretsMatch('s3cret', 's3crea')).toBe(false);
+  });
+
+  // Hashing first is what lets differing lengths be compared at all —
+  // timingSafeEqual throws on a length mismatch.
+  it('handles differing lengths without throwing', () => {
+    expect(secretsMatch('short', 'a-much-longer-secret')).toBe(false);
+  });
+
+  it('never accepts an empty side, so an unset secret is not a skeleton key', () => {
+    expect(secretsMatch('', '')).toBe(false);
+    expect(secretsMatch('', 'x')).toBe(false);
+    expect(secretsMatch('x', '')).toBe(false);
   });
 });

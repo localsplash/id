@@ -153,6 +153,129 @@ some users hold genuine `@example.ai` primaries and arrive with
 `hd=example.ai`: set `SUPERADMIN_DOMAIN = example.com, example.ai` and both
 populations qualify, with no migration.
 
+## Integrating an application
+
+Each app's session is its own — id's session and the app's are separate
+rows behind separate cookies. That is what makes the app fast (no round
+trip per request), and it is also why an app has to be *told* when a login
+is revoked: without that, revoking at id only stops **new** sign-ins while
+the person stays logged into every app they already reached.
+
+Apps therefore implement one endpoint. There is no polling and no cron.
+
+### 1. Register on boot
+
+```http
+POST /api/apps/register
+Content-Type: application/json
+
+{ "client_secret": "<ID_CLIENT_SECRET>",
+  "name": "EchoWeb",
+  "webhook_url": "https://app.X.TLD/id/events" }
+```
+
+```json
+{ "ok": true, "origin": "https://app.X.TLD", "secret": "…",
+  "events": ["ping", "session.revoked", "user.merged", "identity.linked", "identity.unlinked"] }
+```
+
+`webhook_url` must be https and under `PARENT_DOMAIN` — the same rule as a
+`redirect_uri`. The returned `secret` signs deliveries to this app; it is
+minted once and returned on every registration, so hold it in memory rather
+than configuring it. id immediately queues a `ping` so a broken endpoint
+shows up now rather than at the first real revocation.
+
+### 2. Receive events
+
+```http
+POST /id/events
+X-Id-Event: session.revoked
+X-Id-Event-Id: 1234
+X-Id-Timestamp: 1774500000
+X-Id-Signature: sha256=<hex>
+
+{ "id": 1234, "type": "session.revoked", "occurredAt": "2026-08-26T06:00:00.000Z",
+  "data": { "iUserId": 7, "scope": "all" } }
+```
+
+A receiver **must**:
+
+- verify `X-Id-Signature` as `HMAC-SHA256(secret, "<X-Id-Timestamp>.<rawBody>")`
+  against the **raw** body — not a re-serialised object;
+- compare in constant time;
+- reject a timestamp more than **300s** from now (the timestamp is inside
+  the MAC, so this is what stops a captured delivery being replayed);
+- be **idempotent** — failures are retried, so the same event id can arrive
+  more than once;
+- answer **2xx only once the event is durably handled**. Anything else, or a
+  timeout past 10s, counts as a failure.
+
+Retries back off at 0s, 30s, 2m, 10m, 1h, 6h and are then abandoned and
+shown in the dashboard.
+
+| Event | `data` | What the app should do |
+| --- | --- | --- |
+| `ping` | `{ origin }` | Nothing; answer 2xx |
+| `session.revoked` | `{ iUserId, scope: 'all' \| 'one', sessionId? }` | End its own sessions for that id user |
+| `user.merged` | `{ fromUserId, toUserId }` | Repoint its local mapping from `fromUserId` to `toUserId`, end sessions for the retired user |
+| `identity.linked` / `identity.unlinked` | `{ iUserId, provider, subject }` | Usually nothing; apps that bind on a specific identity (EchoWeb binds an org by UISP `clientId`) may care |
+
+### 3. Catch up at boot
+
+Retries cover a brief outage; an app down longer than the schedule would
+still have a hole. Read forward once at startup from the last event id it
+processed:
+
+```http
+GET /api/events?since=1234
+X-Id-Client-Secret: <ID_CLIENT_SECRET>
+```
+
+Combined with idempotent handlers, that closes the gap without a timer.
+
+### Reference verification
+
+```ts
+import crypto from 'crypto';
+
+function verify(secret: string, rawBody: string, headers: Record<string, string>): boolean {
+  const ts = Number(headers['x-id-timestamp']);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > 300) return false;
+  const expected = crypto.createHmac('sha256', secret)
+    .update(`${ts}.${rawBody}`).digest('hex');
+  const got = (headers['x-id-signature'] ?? '').replace(/^sha256=/, '');
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(got, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+```
+
+### Watching the integrations
+
+`/admin` lists every application and derives a status:
+
+- **listening** — registered, deliveries succeeding
+- **registered, unverified** — registered, nothing delivered successfully yet
+- **not listening** — registered, deliveries failing; revocations are *not*
+  reaching it
+- **not integrated** — the app redeems handoff codes but never registered a
+  webhook at all
+
+That last one needs no configuration to detect: id records the origin of
+every app that redeems a code at `/api/token`, so an app that does login but
+skipped the receiver announces itself by working. Each row shows the last
+handoff, last delivery, queue depth, last error, and a **Send test event**
+button.
+
+## Remapping identities between users
+
+One person can end up as two id users — they came through the ISP bridge
+first and later signed in with Google, or a provider that does not vouch
+for its addresses could not be auto-linked. `/admin` → **Merge into…** folds
+one into the other: login methods move, the retired user's sessions are
+revoked, and `user.merged` goes out so every app repoints its own mapping
+instead of stranding rows against a user id that no longer exists.
+
 ## Adding a provider
 
 Add one `ProviderDescriptor` to `src/providers.ts` (id, label,
