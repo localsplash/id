@@ -66,10 +66,10 @@ the **`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`:
 
 | Key | Purpose |
 | --- | --- |
-| `PARENT_DOMAIN` | Apex domain (`X.TLD`); drives the cookie scope, redirect allowlist, and default super-admin domain |
+| `PARENT_DOMAIN` | Apex domain (`X.TLD`) the **apps** are served from; drives the cookie scope and redirect allowlist, and is the default super-admin domain |
 | `APP_BASE_URL` | Public base URL of this app, e.g. `https://id.X.TLD` |
 | `ID_CLIENT_SECRET` | Shared secret apps present at `/api/token` |
-| `SUPERADMIN_DOMAIN` | Override for the super-admin email domain (default `PARENT_DOMAIN`) |
+| `SUPERADMIN_DOMAIN` | Domain(s) the **identity provider vouches for** whose users are Super System Admins — comma-separated list accepted (default: `PARENT_DOMAIN`) |
 | `DEFAULT_REDIRECT_URI` | Where an unsolicited sign-in (e.g. from the ISP portal) lands |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth |
 | `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` / `MICROSOFT_TENANT` | Microsoft Entra ID OAuth |
@@ -92,16 +92,22 @@ claiming it:
 1. It checks the NocoDB settings store first — if `NOCODB_API_TOKEN` (or
    `NOCODB_BASE_URL`) is missing or wrong, the wizard says exactly that:
    those two must be set in the environment before anything can be saved.
-2. The admin enters the parent domain (`X.TLD`) and credentials for
+2. The admin enters the application domain (`X.TLD`) and credentials for
    **Google or Microsoft** (the wizard is limited to providers that can
    prove a domain; Microsoft additionally requires a tenant ID — `common`
-   cannot prove anything).
+   cannot prove anything). A Super Admin domain can be given too, but it is
+   optional — see below.
 3. The credentials are held in a short-lived cookie — *not* saved — while a
    real OAuth round trip runs against them.
-4. Only if the sign-in works **and** the verified account is on the claimed
-   domain does the wizard persist everything to `oAuthConfig` (also minting
-   `ID_CLIENT_SECRET`), make the claimer Super System Admin, and land them
-   on `/admin`. A failed or off-domain attempt saves nothing.
+4. Only if the sign-in works **and** the verified account is on the Super
+   Admin domain does the wizard persist everything to `oAuthConfig` (also
+   minting `ID_CLIENT_SECRET`), make the claimer Super System Admin, and
+   land them on `/admin`. A failed or off-domain attempt saves nothing.
+5. If the sign-in works but the account is on a *different* domain, the
+   wizard says which domain the provider actually vouched for and offers it
+   as the Super Admin domain. Confirming re-runs the sign-in with that value
+   in place — so the grant still rests on a fresh, matching identity, never
+   on the suggestion.
 
 The wizard closes permanently the moment any provider is configured; later
 changes happen in `/admin` or directly in NocoDB at `nocodb.X.TLD`.
@@ -109,12 +115,43 @@ changes happen in `/admin` or directly in NocoDB at `nocodb.X.TLD`.
 ## Super System Admin
 
 A user is a Super System Admin when their **provider-verified** email
-domain matches `SUPERADMIN_DOMAIN` (default: `PARENT_DOMAIN`). Only
+domain is one of `SUPERADMIN_DOMAIN` (default: `PARENT_DOMAIN`). Only
 providers that cryptographically vouch for the domain qualify — Google
-(Workspace `hd` / verified address) does; Microsoft with a `common`
-authority does not, since any tenant can claim any address. Admins can edit
-`oAuthConfig`, inspect users and identities, unlink identities (never a
-user's last one), and revoke sessions.
+(Workspace `hd` / verified address) does; Microsoft only when the app is
+locked to a single tenant, since with a `common` authority any directory
+could assert any address. Admins can edit `oAuthConfig`, inspect users and
+identities, unlink identities (never a user's last one), and revoke
+sessions.
+
+### When the app domain and the identity domain differ
+
+`PARENT_DOMAIN` and `SUPERADMIN_DOMAIN` answer two different questions —
+where the apps live, and where the people come from — and they are
+routinely not the same string.
+
+The everyday case is a **Google Workspace domain alias**. With apps at
+`*.example.ai` and a Workspace whose *primary* domain is `example.com`,
+`example.ai` being an alias, every sign-in comes back as
+`user@example.com` with `hd=example.com`. Google asserts the primary domain
+and never the alias — signing in as `user@example.ai` resolves to the same
+account and still yields the primary in the token. There is no runtime
+signal that ties the two domains together (the alias list is only readable
+through an admin-scoped Directory API call, which an external consent
+screen cannot ask for), so the relationship is **declared, not detected**:
+
+```
+PARENT_DOMAIN      = example.ai      # cookie scope, redirect allowlist
+SUPERADMIN_DOMAIN  = example.com     # what Google actually vouches for
+```
+
+The setup wizard reaches this configuration for you — it reports the domain
+the provider vouched for and offers it — but it is one line to set by hand
+too.
+
+The list form covers a later move from alias to **secondary domain**, where
+some users hold genuine `@example.ai` primaries and arrive with
+`hd=example.ai`: set `SUPERADMIN_DOMAIN = example.com, example.ai` and both
+populations qualify, with no migration.
 
 ## Adding a provider
 

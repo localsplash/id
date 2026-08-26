@@ -7,11 +7,15 @@ import {
   decodeState,
   suggestParentDomain,
   isValidDomain,
+  isValidDomainList,
 } from './web';
 import {
   availableLoginMethods,
   isSuperAdmin,
   isTenantLocked,
+  parseDomainList,
+  superAdminDomains,
+  verifiedDomain,
   parseMicrosoftIdToken,
   getProvider,
 } from './providers';
@@ -157,6 +161,94 @@ describe('isSuperAdmin', () => {
   it('grants nothing when no domain is configured', () => {
     expect(isSuperAdmin(google, { sub: 's', email: 'a@wisp.net', name: 'A' }, {})).toBe(false);
   });
+
+  // A Google Workspace domain alias: the apps are served from example.ai but
+  // every token carries the Workspace primary, example.com. Naming the app
+  // domain alone must not grant, and naming the primary must.
+  describe('Workspace domain alias (apps on one domain, identities on another)', () => {
+    const aliasUser = {
+      sub: 's',
+      email: 'ada@localsplash.com',
+      name: 'Ada',
+      hd: 'localsplash.com',
+    };
+
+    it('does not grant on the application domain alone', () => {
+      expect(isSuperAdmin(google, aliasUser, { PARENT_DOMAIN: 'localsplash.ai' })).toBe(false);
+    });
+
+    it('grants when SUPERADMIN_DOMAIN names the domain the provider vouches for', () => {
+      expect(
+        isSuperAdmin(google, aliasUser, {
+          PARENT_DOMAIN: 'localsplash.ai',
+          SUPERADMIN_DOMAIN: 'localsplash.com',
+        })
+      ).toBe(true);
+    });
+
+    it('accepts a list, so a later secondary-domain user also qualifies', () => {
+      const settings = {
+        PARENT_DOMAIN: 'localsplash.ai',
+        SUPERADMIN_DOMAIN: 'localsplash.com, localsplash.ai',
+      };
+      expect(isSuperAdmin(google, aliasUser, settings)).toBe(true);
+      expect(
+        isSuperAdmin(
+          google,
+          { sub: 's2', email: 'bob@localsplash.ai', name: 'Bob', hd: 'localsplash.ai' },
+          settings
+        )
+      ).toBe(true);
+      // An unrelated domain still gets nothing.
+      expect(
+        isSuperAdmin(google, { sub: 's3', email: 'eve@evil.com', name: 'Eve' }, settings)
+      ).toBe(false);
+    });
+  });
+});
+
+describe('parseDomainList', () => {
+  it('normalises case, whitespace and a stray @', () => {
+    expect(parseDomainList(' Localsplash.COM , @localsplash.ai ')).toEqual([
+      'localsplash.com',
+      'localsplash.ai',
+    ]);
+  });
+
+  it('drops empty entries', () => {
+    expect(parseDomainList(',, ,')).toEqual([]);
+    expect(parseDomainList('a.com,,b.com')).toEqual(['a.com', 'b.com']);
+  });
+});
+
+describe('superAdminDomains', () => {
+  it('falls back to the application domain when unset', () => {
+    expect(superAdminDomains({ PARENT_DOMAIN: 'wisp.net' })).toEqual(['wisp.net']);
+  });
+
+  it('overrides the fallback entirely once set', () => {
+    expect(
+      superAdminDomains({ PARENT_DOMAIN: 'localsplash.ai', SUPERADMIN_DOMAIN: 'localsplash.com' })
+    ).toEqual(['localsplash.com']);
+  });
+});
+
+describe('verifiedDomain', () => {
+  it('prefers the hosted domain, which names the Workspace rather than the address', () => {
+    expect(verifiedDomain({ sub: 's', email: 'a@gmail.com', name: 'A', hd: 'wisp.net' })).toBe(
+      'wisp.net'
+    );
+  });
+
+  it('falls back to the address domain, lowercased', () => {
+    expect(verifiedDomain({ sub: 's', email: 'Ada@Localsplash.COM', name: 'A' })).toBe(
+      'localsplash.com'
+    );
+  });
+
+  it('returns empty for an address it cannot read', () => {
+    expect(verifiedDomain({ sub: 's', email: '', name: 'A' })).toBe('');
+  });
 });
 
 describe('parseMicrosoftIdToken', () => {
@@ -203,6 +295,14 @@ describe('setup wizard helpers', () => {
     expect(isValidDomain('not a domain')).toBe(false);
     expect(isValidDomain('nodots')).toBe(false);
     expect(isValidDomain('-bad.com')).toBe(false);
+  });
+
+  it('validates a comma-separated admin domain list', () => {
+    expect(isValidDomainList('localsplash.com')).toBe(true);
+    expect(isValidDomainList('localsplash.com, localsplash.ai')).toBe(true);
+    expect(isValidDomainList('@localsplash.com')).toBe(true);
+    expect(isValidDomainList('')).toBe(false);
+    expect(isValidDomainList('localsplash.com, nodots')).toBe(false);
   });
 });
 

@@ -27,8 +27,10 @@ export const KNOWN_SETTINGS: SettingDef[] = [
     key: 'PARENT_DOMAIN',
     description:
       'Apex domain (X.TLD) that all participating apps live under, e.g. wisp.net. ' +
-      'Drives the SSO cookie scope, the redirect_uri allowlist (any https host under ' +
-      'this domain), and the default super-admin domain.',
+      'Drives the SSO cookie scope and the redirect_uri allowlist (any https host ' +
+      'under this domain). This is where the applications live; where the ' +
+      'identities come from is SUPERADMIN_DOMAIN, which defaults to this but is ' +
+      'not always the same domain.',
   },
   {
     key: 'APP_BASE_URL',
@@ -45,8 +47,13 @@ export const KNOWN_SETTINGS: SettingDef[] = [
   {
     key: 'SUPERADMIN_DOMAIN',
     description:
-      'Email domain whose (provider-verified) users become Super System Admins. ' +
-      'Defaults to PARENT_DOMAIN when empty.',
+      'Domain(s) whose provider-verified users become Super System Admins — a ' +
+      'comma-separated list is accepted. Defaults to PARENT_DOMAIN when empty. ' +
+      'Set it explicitly whenever the identity provider vouches for a different ' +
+      'domain than the apps are served from: with a Google Workspace domain alias ' +
+      '(apps at app.example.ai, Workspace primary example.com) every token comes ' +
+      'back as user@example.com with hd=example.com — Google never asserts the ' +
+      'alias — so this must be example.com.',
   },
   {
     key: 'DEFAULT_REDIRECT_URI',

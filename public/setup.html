@@ -36,6 +36,26 @@
     <!-- NocoDB not usable: setup cannot save anything -->
     <div id="nocodbBlock" class="hidden my-4 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800"></div>
 
+    <!-- Domain mismatch: the credentials worked, the domain did not match -->
+    <div id="confirmPanel" class="hidden my-4 rounded-xl bg-blue-50 border border-blue-200 px-4 py-4">
+      <p class="text-sm font-semibold text-blue-900 mb-1">Sign-in worked — one thing to confirm</p>
+      <p id="confirmBody" class="text-sm text-blue-800 mb-3"></p>
+      <label class="block text-xs font-medium text-blue-900 mb-1">Super Admin domain</label>
+      <input id="confirmDomain" type="text"
+        class="w-full px-3 py-2 rounded-lg border border-blue-200 text-sm font-mono mb-1" />
+      <p class="text-[11px] text-blue-700/70 mb-3">
+        Comma-separate to accept more than one. Nothing is saved until a fresh
+        sign-in proves an account on this domain.
+      </p>
+      <div class="flex items-center gap-3">
+        <button id="confirmBtn"
+          class="py-2 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-medium text-sm">
+          Confirm &amp; continue
+        </button>
+        <a href="/setup" class="text-xs text-blue-700 hover:text-blue-900 underline">Start over</a>
+      </div>
+    </div>
+
     <form id="form" class="hidden mt-6 space-y-4">
       <p class="text-sm text-slate-600">
         Sign in with the OAuth provider of your organisation. If the account you
@@ -45,14 +65,33 @@
       </p>
 
       <div>
-        <label class="block text-xs font-medium text-slate-500 mb-1">Parent domain (X.TLD) — the system / Super Admin domain</label>
+        <label class="block text-xs font-medium text-slate-500 mb-1">Application domain (X.TLD) — where the apps are served</label>
         <input id="parentDomain" type="text" placeholder="example.com" required
           class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
         <p class="text-[11px] text-slate-400 mt-1">
-          All apps under this domain (echo.…, aida.…) will use this sign-in.
-          Your verifying account must be on this domain.
+          All apps under this domain (echo.…, aida.…) will use this sign-in. It
+          sets the SSO cookie scope and the redirect allowlist.
         </p>
       </div>
+
+      <details id="adminDetails" class="rounded-xl border border-slate-200 px-3 py-2">
+        <summary class="text-xs font-medium text-slate-500 cursor-pointer">
+          Super Admin domain — only if it differs from the application domain
+        </summary>
+        <div class="mt-2">
+          <input id="adminDomain" type="text" placeholder="(same as application domain)"
+            class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+          <p class="text-[11px] text-slate-400 mt-1">
+            The domain your identity provider vouches for, which is not always the
+            one the apps are served from. With a Google Workspace <em>domain
+            alias</em> — apps at <span class="font-mono">example.ai</span>, Workspace
+            primary <span class="font-mono">example.com</span> — Google always
+            asserts the primary, so put <span class="font-mono">example.com</span>
+            here. Leave blank if they are the same; the wizard will offer the right
+            value if the sign-in says otherwise.
+          </p>
+        </div>
+      </details>
 
       <div>
         <label class="block text-xs font-medium text-slate-500 mb-1">OAuth provider</label>
@@ -83,6 +122,9 @@
         <label class="block text-xs font-medium text-slate-500 mb-1">Client secret</label>
         <input id="clientSecret" type="password" required
           class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        <p id="secretKept" class="hidden text-[11px] text-slate-400 mt-1">
+          Kept from your previous attempt — leave blank to reuse it.
+        </p>
       </div>
       <div id="tenantRow" class="hidden">
         <label class="block text-xs font-medium text-slate-500 mb-1">Directory (tenant) ID</label>
@@ -100,27 +142,32 @@
       </button>
       <p class="text-[11px] text-slate-400 text-center">
         Nothing is saved unless the sign-in succeeds and your verified account
-        is on the claimed domain.
+        is on the Super Admin domain.
       </p>
     </form>
   </div>
 
   <script>
     const errorMap = {
-      state:           'The setup attempt expired or was tampered with. Please try again.',
-      denied:          'The provider sign-in was cancelled or refused.',
-      verify_failed:   'The provider rejected these credentials (check client ID/secret and the registered redirect URI).',
-      domain_mismatch: 'Sign-in worked, but the account is not on the claimed domain — nothing was saved.',
+      state:         'The setup attempt expired or was tampered with. Please try again.',
+      denied:        'The provider sign-in was cancelled or refused.',
+      verify_failed: 'The provider rejected these credentials (check client ID/secret and the registered redirect URI).',
     };
     const q = new URLSearchParams(location.search);
-    if (q.get('error')) {
+
+    // `verified` and `claimed` come off the query string, so anyone can put
+    // anything in them — they are only ever suggestions to a human here, but
+    // they still get escaped before going anywhere near innerHTML.
+    const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
+      { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
+    ));
+
+    function showError(msg) {
       const el = document.getElementById('errorBanner');
-      let msg = errorMap[q.get('error')] || 'Setup failed. Please try again.';
-      if (q.get('error') === 'domain_mismatch' && q.get('domain'))
-        msg = `Sign-in worked, but the account is not on ${q.get('domain')} — nothing was saved.`;
       el.textContent = msg;
       el.classList.remove('hidden');
     }
+    if (q.get('error') && errorMap[q.get('error')]) showError(errorMap[q.get('error')]);
 
     let CALLBACKS = { google: '', microsoft: '' };
     let APP_BASE = '';
@@ -148,6 +195,63 @@
       r.addEventListener('change', refreshProviderUi)
     );
 
+    async function start(body) {
+      const r = await fetch('/api/setup/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        showError(data.error || 'Could not start setup.');
+        window.scrollTo(0, 0);
+        return;
+      }
+      location.href = data.authUrl;
+    }
+
+    /**
+     * The credentials verified, but the account was not on the claimed domain.
+     * The provider told us which domain it *did* vouch for — offer that, since
+     * a Workspace domain alias lands here every time and the primary domain is
+     * the answer. Confirming re-runs the sign-in with it in place.
+     */
+    function renderConfirm(pending) {
+      const verified = q.get('verified') || '';
+      const claimed = q.get('claimed') || '';
+
+      if (!pending) {
+        showError(
+          `Your account verified as ${verified || 'another domain'}, not ${claimed}. ` +
+          'The setup attempt has since expired — please start again.'
+        );
+        return false;
+      }
+
+      const v = esc(verified), c = esc(claimed);
+      document.getElementById('confirmBody').innerHTML =
+        `Your account verified as <span class="font-mono font-semibold">${v}</span>, ` +
+        `but the claim named <span class="font-mono font-semibold">${c}</span>. ` +
+        `If <span class="font-mono">${c}</span> is a domain alias of that Workspace, ` +
+        `<span class="font-mono">${v}</span> is your Super Admin domain — your provider ` +
+        'always asserts the primary domain, never the alias.';
+      document.getElementById('confirmDomain').value = verified;
+      document.getElementById('confirmPanel').classList.remove('hidden');
+
+      document.getElementById('confirmBtn').onclick = () =>
+        start({
+          parentDomain: pending.parentDomain,
+          adminDomain: document.getElementById('confirmDomain').value.trim(),
+          provider: pending.provider,
+          clientId: pending.clientId,
+          tenant: pending.tenant,
+          // Omitted on purpose: the server reuses the secret held with the
+          // pending claim rather than making it round-trip the browser again.
+          clientSecret: '',
+        });
+      return true;
+    }
+
     fetch('/api/setup/status')
       .then((r) => r.json())
       .then((s) => {
@@ -161,34 +265,40 @@
         }
         CALLBACKS = s.callbackUrls;
         APP_BASE = s.suggested.appBaseUrl || '';
-        document.getElementById('parentDomain').value = s.suggested.parentDomain || '';
+
+        if (q.get('error') === 'domain_mismatch' && renderConfirm(s.pending)) return;
+
+        const p = s.pending;
+        document.getElementById('parentDomain').value =
+          (p && p.parentDomain) || s.suggested.parentDomain || '';
+        if (p) {
+          document.getElementById('clientId').value = p.clientId || '';
+          document.getElementById('tenant').value = p.tenant || '';
+          if (p.adminDomain) {
+            document.getElementById('adminDomain').value = p.adminDomain;
+            document.getElementById('adminDetails').open = true;
+          }
+          const radio = document.querySelector(`input[name="provider"][value="${p.provider}"]`);
+          if (radio) radio.checked = true;
+          const secret = document.getElementById('clientSecret');
+          secret.required = false;
+          secret.placeholder = '••••••• (kept)';
+          document.getElementById('secretKept').classList.remove('hidden');
+        }
         document.getElementById('form').classList.remove('hidden');
         refreshProviderUi();
       });
 
-    document.getElementById('form').addEventListener('submit', async (e) => {
+    document.getElementById('form').addEventListener('submit', (e) => {
       e.preventDefault();
-      const body = {
+      start({
         parentDomain: document.getElementById('parentDomain').value.trim(),
+        adminDomain: document.getElementById('adminDomain').value.trim(),
         provider: currentProvider(),
         clientId: document.getElementById('clientId').value.trim(),
         clientSecret: document.getElementById('clientSecret').value.trim(),
         tenant: document.getElementById('tenant').value.trim(),
-      };
-      const r = await fetch('/api/setup/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
       });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        const el = document.getElementById('errorBanner');
-        el.textContent = data.error || 'Could not start setup.';
-        el.classList.remove('hidden');
-        window.scrollTo(0, 0);
-        return;
-      }
-      location.href = data.authUrl;
     });
   </script>
 </body>
