@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>id · Admin</title>
+  <link rel="icon" href="/img/id-favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: { extend: { fontFamily: { sans: ['Inter','system-ui','sans-serif'] } } }
+    }
+  </script>
+</head>
+<body class="bg-slate-100 min-h-screen p-6 font-sans">
+  <div class="max-w-4xl mx-auto">
+
+    <div class="flex items-center justify-between mb-6">
+      <div>
+        <h1 class="text-xl font-bold text-slate-800">Identity admin</h1>
+        <p class="text-sm text-slate-500">Super System Admin console</p>
+      </div>
+      <a href="/account" class="text-sm font-medium text-blue-600 hover:text-blue-700">← Your account</a>
+    </div>
+
+    <div id="banner" class="hidden mb-4 px-4 py-3 rounded-xl text-sm"></div>
+
+    <!-- OAuth postback URLs -->
+    <div class="bg-white rounded-2xl shadow p-6 mb-6">
+      <h2 class="text-sm font-semibold text-slate-700 mb-1">OAuth redirect URIs (postbacks)</h2>
+      <p class="text-xs text-slate-500 mb-4">
+        Each provider's console must be told where to send the browser back after
+        sign-in. Register these exact URLs — they follow
+        <span class="font-mono">APP_BASE_URL</span>, so re-register after changing it.
+      </p>
+      <div id="callbacks" class="space-y-3"></div>
+    </div>
+
+    <!-- oAuthConfig -->
+    <div class="bg-white rounded-2xl shadow p-6 mb-6">
+      <h2 class="text-sm font-semibold text-slate-700 mb-1">oAuthConfig settings</h2>
+      <p class="text-xs text-slate-500 mb-4">
+        Stored in NocoDB. A login method appears on the sign-in page only when all
+        of its required keys are set. Values marked secret are write-only here.
+      </p>
+      <div id="config" class="space-y-3"></div>
+    </div>
+
+    <!-- Users -->
+    <div class="bg-white rounded-2xl shadow p-6">
+      <h2 class="text-sm font-semibold text-slate-700 mb-4">Users & sessions</h2>
+      <div id="users" class="space-y-4"></div>
+    </div>
+
+  </div>
+
+  <script>
+    const SECRET_RE = /(SECRET|KEY|TOKEN|PASSWORD)/i;
+
+    function banner(text, ok) {
+      const el = document.getElementById('banner');
+      el.textContent = text;
+      el.className = 'mb-4 px-4 py-3 rounded-xl text-sm ' +
+        (ok ? 'bg-green-50 border border-green-200 text-green-700'
+            : 'bg-red-50 border border-red-200 text-red-700');
+      setTimeout(() => el.classList.add('hidden'), 4000);
+    }
+
+    // Where each provider's console wants its redirect URI registered.
+    const CONSOLE_HINTS = {
+      google:
+        'Google Cloud Console → APIs & Services → Credentials → your OAuth 2.0 Client ID → ' +
+        '"Authorized redirect URIs". Also add the app base URL under "Authorized JavaScript origins".',
+      microsoft:
+        'Microsoft Entra admin center → App registrations → your app → Authentication → ' +
+        'Platform "Web" → "Redirect URIs".',
+    };
+
+    function renderCallbacks(providers, appBaseUrl) {
+      const wrap = document.getElementById('callbacks');
+      wrap.innerHTML = '';
+      for (const p of providers) {
+        const div = document.createElement('div');
+        div.className = 'rounded-xl bg-slate-50 border border-slate-200 px-3 py-2';
+        const label = document.createElement('div');
+        label.className = 'text-xs font-semibold text-slate-700 mb-0.5';
+        label.textContent = p.label;
+        const code = document.createElement('code');
+        code.className = 'text-xs text-slate-800 break-all block';
+        code.textContent = p.callbackUrl;
+        const hint = document.createElement('p');
+        hint.className = 'text-[11px] text-slate-400 mt-1';
+        hint.textContent = CONSOLE_HINTS[p.id] || 'Register this redirect URI in the provider’s app console.';
+        div.append(label, code, hint);
+        wrap.appendChild(div);
+      }
+      const origin = document.createElement('p');
+      origin.className = 'text-[11px] text-slate-400 mt-1';
+      origin.textContent = `App base URL (JavaScript origin for Google): ${appBaseUrl}`;
+      wrap.appendChild(origin);
+    }
+
+    async function loadConfig() {
+      const resp = await fetch('/api/admin/config');
+      if (resp.status === 403) { location.href = '/'; return; }
+      const { items, providers, appBaseUrl } = await resp.json();
+      renderCallbacks(providers || [], appBaseUrl || '');
+      const wrap = document.getElementById('config');
+      wrap.innerHTML = '';
+      for (const row of items) {
+        const secret = SECRET_RE.test(row.key);
+        const div = document.createElement('div');
+        div.className = 'flex flex-col sm:flex-row sm:items-center gap-2';
+        div.innerHTML = `
+          <div class="sm:w-64 flex-shrink-0">
+            <span class="text-sm font-medium text-slate-700 font-mono">${row.key}</span>
+            <span class="block text-[11px] text-slate-400 leading-tight">${row.description || ''}</span>
+          </div>`;
+        const input = document.createElement('input');
+        input.type = secret ? 'password' : 'text';
+        input.placeholder = secret && row.value ? '••••••• (set)' : row.value ? '' : '(not set)';
+        input.value = secret ? '' : row.value;
+        input.className = 'flex-1 px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono';
+        const btn = document.createElement('button');
+        btn.textContent = 'Save';
+        btn.className = 'px-3 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700';
+        btn.onclick = async () => {
+          const r = await fetch(`/api/admin/config/${encodeURIComponent(row.key)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: input.value }),
+          });
+          banner(r.ok ? `${row.key} saved.` : `Failed to save ${row.key}.`, r.ok);
+          if (r.ok) loadConfig();
+        };
+        div.appendChild(input);
+        div.appendChild(btn);
+        wrap.appendChild(div);
+      }
+    }
+
+    async function loadUsers() {
+      const resp = await fetch('/api/admin/users');
+      if (!resp.ok) return;
+      const { items } = await resp.json();
+      const wrap = document.getElementById('users');
+      wrap.innerHTML = '';
+      for (const u of items) {
+        const div = document.createElement('div');
+        div.className = 'border border-slate-100 rounded-xl p-4';
+        const head = document.createElement('div');
+        head.className = 'flex items-center justify-between mb-2';
+        head.innerHTML = `<div>
+            <span class="text-sm font-medium text-slate-800">${u.displayName || u.email || 'User ' + u.iUserId}</span>
+            <span class="text-xs text-slate-400 ml-2">#${u.iUserId}</span>
+          </div>
+          <span class="text-xs text-slate-500">${u.activeSessions} active session(s)</span>`;
+        div.appendChild(head);
+
+        for (const i of u.identities) {
+          const row = document.createElement('div');
+          row.className = 'flex items-center justify-between text-xs text-slate-600 py-1';
+          row.innerHTML = `<span class="font-mono">${i.provider} · ${i.email || i.subject}</span>`;
+          const unlink = document.createElement('button');
+          unlink.textContent = 'Unlink';
+          unlink.className = 'text-red-500 hover:text-red-700';
+          unlink.onclick = async () => {
+            const r = await fetch(`/api/admin/identities/${i.iIdentityId}`, { method: 'DELETE' });
+            const body = await r.json();
+            banner(r.ok ? 'Identity unlinked.' : body.error || 'Failed.', r.ok);
+            loadUsers();
+          };
+          row.appendChild(unlink);
+          div.appendChild(row);
+        }
+
+        if (u.activeSessions > 0) {
+          const revoke = document.createElement('button');
+          revoke.textContent = 'Revoke all sessions';
+          revoke.className = 'mt-2 text-xs text-red-600 hover:text-red-800 font-medium';
+          revoke.onclick = async () => {
+            const r = await fetch(`/api/admin/users/${u.iUserId}/revoke-sessions`, { method: 'POST' });
+            const body = await r.json();
+            banner(r.ok ? `Revoked ${body.revoked} session(s).` : 'Failed.', r.ok);
+            loadUsers();
+          };
+          div.appendChild(revoke);
+        }
+        wrap.appendChild(div);
+      }
+    }
+
+    loadConfig();
+    loadUsers();
+  </script>
+</body>
+</html>

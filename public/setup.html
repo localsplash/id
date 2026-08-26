@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>First-run Setup</title>
+  <link rel="icon" href="/img/id-favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: { extend: { fontFamily: { sans: ['Inter','system-ui','sans-serif'] } } }
+    }
+  </script>
+</head>
+<body class="bg-gradient-to-br from-slate-100 to-blue-50 min-h-screen flex items-center justify-center p-4 font-sans">
+
+  <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-lg">
+
+    <div class="flex items-center gap-3 mb-2">
+      <div class="w-11 h-11 rounded-xl bg-slate-800 flex items-center justify-center flex-shrink-0">
+        <svg class="w-6 h-6 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <circle cx="12" cy="8.5" r="3.5"/><path stroke-linecap="round" d="M5 19.5c1.4-3.2 4-4.8 7-4.8s5.6 1.6 7 4.8"/>
+        </svg>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold text-slate-800">Set up this identity service</h1>
+        <p class="text-xs text-slate-500">No sign-in method is configured yet — claim it now</p>
+      </div>
+    </div>
+
+    <div id="errorBanner" class="hidden my-4 px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700"></div>
+
+    <!-- NocoDB not usable: setup cannot save anything -->
+    <div id="nocodbBlock" class="hidden my-4 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800"></div>
+
+    <form id="form" class="hidden mt-6 space-y-4">
+      <p class="text-sm text-slate-600">
+        Sign in with the OAuth provider of your organisation. If the account you
+        verify with belongs to the domain you claim below, you become the Super
+        System Admin and these values are saved to the shared
+        <span class="font-mono text-xs">oAuthConfig</span> settings table.
+      </p>
+
+      <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">Parent domain (X.TLD) — the system / Super Admin domain</label>
+        <input id="parentDomain" type="text" placeholder="example.com" required
+          class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        <p class="text-[11px] text-slate-400 mt-1">
+          All apps under this domain (echo.…, aida.…) will use this sign-in.
+          Your verifying account must be on this domain.
+        </p>
+      </div>
+
+      <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">OAuth provider</label>
+        <div class="flex gap-3">
+          <label class="flex items-center gap-2 text-sm text-slate-700">
+            <input type="radio" name="provider" value="google" checked /> Google
+          </label>
+          <label class="flex items-center gap-2 text-sm text-slate-700">
+            <input type="radio" name="provider" value="microsoft" /> Microsoft
+          </label>
+        </div>
+      </div>
+
+      <div class="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2">
+        <p class="text-[11px] font-semibold text-slate-600 mb-0.5">
+          OAuth postback — register this exact redirect URI with the provider first:
+        </p>
+        <code id="callbackUrl" class="text-xs text-slate-800 break-all block"></code>
+        <p id="callbackHint" class="text-[11px] text-slate-400 mt-1"></p>
+      </div>
+
+      <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">Client ID</label>
+        <input id="clientId" type="text" required
+          class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">Client secret</label>
+        <input id="clientSecret" type="password" required
+          class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+      </div>
+      <div id="tenantRow" class="hidden">
+        <label class="block text-xs font-medium text-slate-500 mb-1">Directory (tenant) ID</label>
+        <input id="tenant" type="text" placeholder="00000000-0000-0000-0000-000000000000"
+          class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        <p class="text-[11px] text-slate-400 mt-1">
+          Required — a tenant-locked app is how Microsoft can prove your domain
+          ('common' cannot).
+        </p>
+      </div>
+
+      <button type="submit"
+        class="w-full py-3 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-medium text-sm transition-all">
+        Verify by signing in &amp; claim
+      </button>
+      <p class="text-[11px] text-slate-400 text-center">
+        Nothing is saved unless the sign-in succeeds and your verified account
+        is on the claimed domain.
+      </p>
+    </form>
+  </div>
+
+  <script>
+    const errorMap = {
+      state:           'The setup attempt expired or was tampered with. Please try again.',
+      denied:          'The provider sign-in was cancelled or refused.',
+      verify_failed:   'The provider rejected these credentials (check client ID/secret and the registered redirect URI).',
+      domain_mismatch: 'Sign-in worked, but the account is not on the claimed domain — nothing was saved.',
+    };
+    const q = new URLSearchParams(location.search);
+    if (q.get('error')) {
+      const el = document.getElementById('errorBanner');
+      let msg = errorMap[q.get('error')] || 'Setup failed. Please try again.';
+      if (q.get('error') === 'domain_mismatch' && q.get('domain'))
+        msg = `Sign-in worked, but the account is not on ${q.get('domain')} — nothing was saved.`;
+      el.textContent = msg;
+      el.classList.remove('hidden');
+    }
+
+    let CALLBACKS = { google: '', microsoft: '' };
+    let APP_BASE = '';
+
+    const CONSOLE_HINTS = {
+      google: () =>
+        'Google Cloud Console → APIs & Services → Credentials → your OAuth 2.0 Client ID → ' +
+        `"Authorized redirect URIs". Also add ${APP_BASE || 'the app base URL'} under ` +
+        '"Authorized JavaScript origins".',
+      microsoft: () =>
+        'Microsoft Entra admin center → App registrations → your app → Authentication → ' +
+        'Platform "Web" → "Redirect URIs".',
+    };
+
+    function currentProvider() {
+      return document.querySelector('input[name="provider"]:checked').value;
+    }
+    function refreshProviderUi() {
+      const p = currentProvider();
+      document.getElementById('tenantRow').classList.toggle('hidden', p !== 'microsoft');
+      document.getElementById('callbackUrl').textContent = CALLBACKS[p] || '';
+      document.getElementById('callbackHint').textContent = CONSOLE_HINTS[p] ? CONSOLE_HINTS[p]() : '';
+    }
+    document.querySelectorAll('input[name="provider"]').forEach((r) =>
+      r.addEventListener('change', refreshProviderUi)
+    );
+
+    fetch('/api/setup/status')
+      .then((r) => r.json())
+      .then((s) => {
+        if (!s.unclaimed) { location.href = '/'; return; }
+        if (s.nocodb !== 'ok') {
+          const block = document.getElementById('nocodbBlock');
+          block.textContent = s.nocodbHint ||
+            'The NocoDB settings store is not available; set its environment variables first.';
+          block.classList.remove('hidden');
+          return; // no form until settings can actually be saved
+        }
+        CALLBACKS = s.callbackUrls;
+        APP_BASE = s.suggested.appBaseUrl || '';
+        document.getElementById('parentDomain').value = s.suggested.parentDomain || '';
+        document.getElementById('form').classList.remove('hidden');
+        refreshProviderUi();
+      });
+
+    document.getElementById('form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = {
+        parentDomain: document.getElementById('parentDomain').value.trim(),
+        provider: currentProvider(),
+        clientId: document.getElementById('clientId').value.trim(),
+        clientSecret: document.getElementById('clientSecret').value.trim(),
+        tenant: document.getElementById('tenant').value.trim(),
+      };
+      const r = await fetch('/api/setup/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const el = document.getElementById('errorBanner');
+        el.textContent = data.error || 'Could not start setup.';
+        el.classList.remove('hidden');
+        window.scrollTo(0, 0);
+        return;
+      }
+      location.href = data.authUrl;
+    });
+  </script>
+</body>
+</html>
