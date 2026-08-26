@@ -12,6 +12,8 @@ import {
   availableLoginMethods,
   isSuperAdmin,
   isTenantLocked,
+  verifiedDomain,
+  superAdminDomains,
   OAuthState,
   OAuthUserInfo,
   ProviderDescriptor,
@@ -36,6 +38,7 @@ import {
   getSetupFromCookie,
   suggestParentDomain,
   isValidDomain,
+  isValidDomainList,
 } from './web';
 import * as store from './store';
 
@@ -229,6 +232,10 @@ export function buildApp() {
     settingsStore.invalidate();
     const settings = await getSettings();
 
+    // Once claimed there is no wizard, and the diagnostics below name
+    // internal infrastructure — so say only that, to anyone still asking.
+    if (!isUnclaimed(settings)) return res.json({ unclaimed: false });
+
     let nocodb: 'ok' | 'unconfigured' | 'unreachable' = 'ok';
     let nocodbHint: string | undefined;
     if (!settingsStore.isConfigured()) {
@@ -248,11 +255,26 @@ export function buildApp() {
       }
     }
 
+    // A claim already in flight: enough to rebuild the request without
+    // making the admin retype anything. Never the client secret — the server
+    // reuses the one held in the cookie.
+    const inFlight = getSetupFromCookie(req);
+    const pending = inFlight
+      ? {
+          parentDomain: inFlight.parentDomain,
+          adminDomain: inFlight.adminDomain ?? '',
+          provider: inFlight.provider,
+          clientId: inFlight.clientId,
+          tenant: inFlight.tenant ?? '',
+        }
+      : null;
+
     const base = baseUrl(settings, req);
     return res.json({
       unclaimed: isUnclaimed(settings),
       nocodb,
       nocodbHint,
+      pending,
       suggested: {
         parentDomain: settings.PARENT_DOMAIN ?? suggestParentDomain(String(req.headers.host ?? '')),
         appBaseUrl: base,
@@ -294,13 +316,28 @@ export function buildApp() {
 
       const body = (req.body ?? {}) as Record<string, string>;
       const parentDomain = String(body.parentDomain ?? '').trim().toLowerCase();
+      const adminDomain = String(body.adminDomain ?? '').trim().toLowerCase();
       const providerId = String(body.provider ?? '');
       const clientId = String(body.clientId ?? '').trim();
-      const clientSecret = String(body.clientSecret ?? '').trim();
       const tenant = String(body.tenant ?? '').trim();
+
+      // Retrying with a corrected admin domain must not make the admin dig
+      // the client secret out again: reuse the one from the pending claim
+      // when the body omits it and the rest of the credentials match.
+      const inFlight = getSetupFromCookie(req);
+      const clientSecret =
+        String(body.clientSecret ?? '').trim() ||
+        (inFlight && inFlight.provider === providerId && inFlight.clientId === clientId
+          ? inFlight.clientSecret
+          : '');
 
       if (!isValidDomain(parentDomain)) {
         return res.status(400).json({ error: 'Enter a valid parent domain, e.g. example.com.' });
+      }
+      if (adminDomain && !isValidDomainList(adminDomain)) {
+        return res.status(400).json({
+          error: 'Super Admin domain must be a domain, or a comma-separated list of domains.',
+        });
       }
       // The wizard is limited to providers that can prove the claimer's domain.
       if (providerId !== 'google' && providerId !== 'microsoft') {
@@ -320,6 +357,7 @@ export function buildApp() {
       const setup: SetupRequest = {
         csrf: store.generateId(16),
         parentDomain,
+        adminDomain: adminDomain || undefined,
         appBaseUrl: baseUrl(settings, req),
         provider: providerId,
         clientId,
@@ -351,6 +389,11 @@ export function buildApp() {
       PARENT_DOMAIN: setup.parentDomain,
       APP_BASE_URL: setup.appBaseUrl,
     };
+    // Only when it differs; otherwise the PARENT_DOMAIN default applies and
+    // no redundant row is written.
+    if (setup.adminDomain && setup.adminDomain !== setup.parentDomain) {
+      candidate.SUPERADMIN_DOMAIN = setup.adminDomain;
+    }
     if (setup.provider === 'google') {
       candidate.GOOGLE_CLIENT_ID = setup.clientId;
       candidate.GOOGLE_CLIENT_SECRET = setup.clientSecret;
@@ -374,30 +417,52 @@ export function buildApp() {
     provider: ProviderDescriptor,
     stored: OAuthState
   ): Promise<string> {
-    clearSetupCookie(res);
+    // The cookie is cleared on every terminal path below, but deliberately
+    // survives a domain mismatch — that is a recoverable step in the wizard,
+    // and keeping it means the retry does not ask for the secret again.
+    const fail = (dest: string): string => {
+      clearSetupCookie(res);
+      return dest;
+    };
 
     settingsStore.invalidate();
     const current = await getSettings();
-    if (!isUnclaimed(current)) return '/?auth_error=already_claimed';
+    if (!isUnclaimed(current)) return fail('/?auth_error=already_claimed');
 
     const setup = getSetupFromCookie(req);
     if (!setup || setup.csrf !== stored.csrf || setup.provider !== provider.id) {
-      return '/setup?error=state';
+      return fail('/setup?error=state');
     }
 
     const returned = decodeState(String(req.query.state ?? ''));
-    if (!returned || returned.csrf !== stored.csrf) return '/setup?error=state';
-    if (req.query.error) return '/setup?error=denied';
+    if (!returned || returned.csrf !== stored.csrf) return fail('/setup?error=state');
+    if (req.query.error) return fail('/setup?error=denied');
     const code = String(req.query.code ?? '');
-    if (!code) return '/setup?error=denied';
+    if (!code) return fail('/setup?error=denied');
 
     const candidate = candidateSettings(setup);
     const userInfo = await provider.fetchUserInfo(candidate, setup.appBaseUrl, code);
-    if (!userInfo?.sub) return '/setup?error=verify_failed';
+    if (!userInfo?.sub) return fail('/setup?error=verify_failed');
 
     if (!isSuperAdmin(provider, userInfo, candidate)) {
-      return `/setup?error=domain_mismatch&domain=${encodeURIComponent(setup.parentDomain)}`;
+      // The credentials work; the account simply is not on a domain this
+      // claim would make Super Admin. Report the domain the provider actually
+      // vouched for so the wizard can offer it — a Google Workspace domain
+      // alias lands here every time, because the token carries the Workspace
+      // primary domain and never the alias the apps are served from.
+      //
+      // The reported domain is only ever a suggestion: confirming it starts a
+      // fresh round trip that must produce a matching identity, so nothing is
+      // granted on the strength of this redirect.
+      const claimed = setup.adminDomain || setup.parentDomain;
+      setSetupCookie(res, setup); // refresh the 10-minute window for the retry
+      return (
+        `/setup?error=domain_mismatch&claimed=${encodeURIComponent(claimed)}` +
+        `&verified=${encodeURIComponent(verifiedDomain(userInfo))}`
+      );
     }
+
+    clearSetupCookie(res);
 
     // Verified: persist the claim. bootstrap() seeds the full key menu; the
     // exchange secret is minted here so apps have one from day one.
@@ -412,7 +477,8 @@ export function buildApp() {
 
     const iUserId = await upsertUserForIdentity(provider.id, true, userInfo);
     logger.warn(
-      `[setup] instance claimed for ${setup.parentDomain} by ${userInfo.email} via ${provider.id}`
+      `[setup] instance claimed for ${setup.parentDomain} by ${userInfo.email} via ${provider.id}` +
+        ` (Super Admin domain: ${superAdminDomains(candidate).join(', ')})`
     );
 
     const dest = await finishLogin(req, res, await getSettings(), {
@@ -837,7 +903,14 @@ export function buildApp() {
         // Derived from APP_BASE_URL, so it changes with that setting.
         callbackUrl: `${base}/auth/${p.id}/callback`,
       }));
-      return res.json({ items: rows, providers: knownProviders, appBaseUrl: base });
+      return res.json({
+        items: rows,
+        providers: knownProviders,
+        appBaseUrl: base,
+        // Resolved rather than raw, so the list form and the PARENT_DOMAIN
+        // fallback are both visible for what they are.
+        superAdminDomains: superAdminDomains(settings),
+      });
     } catch (err) {
       next(err);
     }

@@ -252,7 +252,38 @@ export function availableLoginMethods(settings: Settings): LoginMethod[] {
 }
 
 /**
- * Super System Admin = a user whose provider-verified email domain matches
+ * Domains are configured as a comma-separated list, so one deployment can
+ * accept identities from more than one domain. Entries are normalised: case
+ * folded, whitespace trimmed, a leading '@' dropped.
+ */
+export function parseDomainList(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((d) => d.trim().toLowerCase().replace(/^@/, ''))
+    .filter(Boolean);
+}
+
+/**
+ * The domains whose (provider-verified) members are Super System Admins.
+ *
+ * Defaults to PARENT_DOMAIN, but the two are genuinely different things and
+ * frequently differ in practice. PARENT_DOMAIN is where the *applications*
+ * live — it sets the SSO cookie scope and the redirect allowlist. This is
+ * where the *identities* come from, and the provider decides that, not us.
+ *
+ * The common case is a Google Workspace domain alias: with apps at
+ * app.example.ai and a Workspace whose primary domain is example.com,
+ * every token comes back as user@example.com / hd=example.com — Google
+ * never asserts the alias. SUPERADMIN_DOMAIN=example.com is the answer, and
+ * the list form covers a later move to a secondary domain where some users
+ * really do hold example.ai primaries.
+ */
+export function superAdminDomains(settings: Settings): string[] {
+  return parseDomainList(settings.SUPERADMIN_DOMAIN || settings.PARENT_DOMAIN || '');
+}
+
+/**
+ * Super System Admin = a user whose provider-verified email domain is one of
  * SUPERADMIN_DOMAIN (default: PARENT_DOMAIN). Only providers that vouch for
  * the domain count; anyone can put any address in an unverified claim.
  */
@@ -261,13 +292,25 @@ export function isSuperAdmin(
   userInfo: OAuthUserInfo,
   settings: Settings
 ): boolean {
-  const domain = (settings.SUPERADMIN_DOMAIN || settings.PARENT_DOMAIN || '').toLowerCase();
-  if (!domain || !provider.verifiesEmailDomain(settings)) return false;
-  return emailMatchesDomain(userInfo, domain);
+  if (!provider.verifiesEmailDomain(settings)) return false;
+  const domains = superAdminDomains(settings);
+  return domains.some((d) => emailMatchesDomain(userInfo, d));
 }
 
 export function emailMatchesDomain(userInfo: OAuthUserInfo, domain: string): boolean {
   const d = domain.toLowerCase();
+  if (!d) return false;
   if (userInfo.hd?.toLowerCase() === d) return true;
   return userInfo.email.toLowerCase().endsWith(`@${d}`);
+}
+
+/**
+ * The domain this identity actually presented — what the provider vouched
+ * for, which is what an admin needs to see when a claim does not match.
+ * `hd` wins because it names the Workspace/tenant rather than the address.
+ */
+export function verifiedDomain(userInfo: OAuthUserInfo): string {
+  if (userInfo.hd) return userInfo.hd.toLowerCase();
+  const at = userInfo.email.lastIndexOf('@');
+  return at === -1 ? '' : userInfo.email.slice(at + 1).toLowerCase();
 }

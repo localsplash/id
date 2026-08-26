@@ -167,6 +167,14 @@ export const SETUP_COOKIE = 'id_setup';
 export interface SetupRequest {
   csrf: string;
   parentDomain: string;
+  /**
+   * Domain(s) whose provider-verified members become Super System Admin.
+   * Usually the same as parentDomain, but not when the identity provider
+   * vouches for a different domain than the one the apps live on — a Google
+   * Workspace domain alias being the everyday case. Empty means "same as
+   * parentDomain".
+   */
+  adminDomain?: string;
   appBaseUrl: string;
   provider: 'google' | 'microsoft';
   clientId: string;
@@ -207,6 +215,15 @@ export function suggestParentDomain(host: string): string {
 
 export function isValidDomain(domain: string): boolean {
   return /^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$/i.test(domain);
+}
+
+/** Every entry of a comma-separated domain list must parse. */
+export function isValidDomainList(raw: string): boolean {
+  const parts = raw
+    .split(',')
+    .map((d) => d.trim().replace(/^@/, ''))
+    .filter(Boolean);
+  return parts.length > 0 && parts.every(isValidDomain);
 }
 
 // ─── UISP bridge code verification ───────────────────────────────────────────
