@@ -827,12 +827,17 @@ export function buildApp() {
     try {
       if (!(await requireSuperAdmin(req, res))) return;
       const rows = await settingsStore.listForAdmin();
+      const settings = await getSettings();
+      const base = baseUrl(settings, req);
       const knownProviders = PROVIDERS.map((p) => ({
         id: p.id,
         label: p.label,
         requiredKeys: p.requiredKeys,
+        // The OAuth postback each provider's console must be told about.
+        // Derived from APP_BASE_URL, so it changes with that setting.
+        callbackUrl: `${base}/auth/${p.id}/callback`,
       }));
-      return res.json({ items: rows, providers: knownProviders });
+      return res.json({ items: rows, providers: knownProviders, appBaseUrl: base });
     } catch (err) {
       next(err);
     }

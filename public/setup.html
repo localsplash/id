@@ -67,8 +67,11 @@
       </div>
 
       <div class="rounded-xl bg-slate-50 border border-slate-200 px-3 py-2">
-        <p class="text-[11px] text-slate-500">Register this redirect URI with the provider first:</p>
-        <code id="callbackUrl" class="text-xs text-slate-700 break-all"></code>
+        <p class="text-[11px] font-semibold text-slate-600 mb-0.5">
+          OAuth postback — register this exact redirect URI with the provider first:
+        </p>
+        <code id="callbackUrl" class="text-xs text-slate-800 break-all block"></code>
+        <p id="callbackHint" class="text-[11px] text-slate-400 mt-1"></p>
       </div>
 
       <div>
@@ -120,6 +123,17 @@
     }
 
     let CALLBACKS = { google: '', microsoft: '' };
+    let APP_BASE = '';
+
+    const CONSOLE_HINTS = {
+      google: () =>
+        'Google Cloud Console → APIs & Services → Credentials → your OAuth 2.0 Client ID → ' +
+        `"Authorized redirect URIs". Also add ${APP_BASE || 'the app base URL'} under ` +
+        '"Authorized JavaScript origins".',
+      microsoft: () =>
+        'Microsoft Entra admin center → App registrations → your app → Authentication → ' +
+        'Platform "Web" → "Redirect URIs".',
+    };
 
     function currentProvider() {
       return document.querySelector('input[name="provider"]:checked').value;
@@ -128,6 +142,7 @@
       const p = currentProvider();
       document.getElementById('tenantRow').classList.toggle('hidden', p !== 'microsoft');
       document.getElementById('callbackUrl').textContent = CALLBACKS[p] || '';
+      document.getElementById('callbackHint').textContent = CONSOLE_HINTS[p] ? CONSOLE_HINTS[p]() : '';
     }
     document.querySelectorAll('input[name="provider"]').forEach((r) =>
       r.addEventListener('change', refreshProviderUi)
@@ -145,6 +160,7 @@
           return; // no form until settings can actually be saved
         }
         CALLBACKS = s.callbackUrls;
+        APP_BASE = s.suggested.appBaseUrl || '';
         document.getElementById('parentDomain').value = s.suggested.parentDomain || '';
         document.getElementById('form').classList.remove('hidden');
         refreshProviderUi();
