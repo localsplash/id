@@ -32,6 +32,7 @@ import {
   getAuthRequestFromCookie,
   validateRedirectUri,
   verifySsoCode,
+  secretsMatch,
   SetupRequest,
   setSetupCookie,
   clearSetupCookie,
@@ -759,7 +760,7 @@ export function buildApp() {
       if (!settings.ID_CLIENT_SECRET) {
         return res.status(503).json({ error: 'ID_CLIENT_SECRET is not configured' });
       }
-      if (!client_secret || client_secret !== settings.ID_CLIENT_SECRET) {
+      if (!secretsMatch(client_secret, settings.ID_CLIENT_SECRET)) {
         return res.status(401).json({ error: 'Invalid client secret' });
       }
       if (!code || !redirect_uri) {
@@ -823,7 +824,7 @@ export function buildApp() {
         req.get('X-Id-Client-Secret') ??
         ''
     );
-    if (presented !== settings.ID_CLIENT_SECRET) {
+    if (!secretsMatch(presented, settings.ID_CLIENT_SECRET)) {
       res.status(401).json({ error: 'Invalid client secret' });
       return null;
     }

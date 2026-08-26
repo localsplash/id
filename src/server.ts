@@ -23,11 +23,20 @@ async function main() {
   // Webhook delivery ticker. Deliveries are durable rows, so this is a
   // drain loop rather than a scheduler: a restart mid-retry resumes here,
   // and a due row is picked up within one tick.
+  //
+  // A pass is serial and each delivery may sit on a 10s timeout, so it can
+  // easily outlast the 5s interval. Without this guard the next tick would
+  // pick up rows the running pass has not marked yet and send them twice.
+  let draining = false;
   const tick = async () => {
+    if (draining) return;
+    draining = true;
     try {
       await drainDeliveries(db);
     } catch (err) {
       console.error(`[webhooks] delivery pass failed: ${String(err)}`);
+    } finally {
+      draining = false;
     }
   };
   const ticker = setInterval(() => void tick(), 5_000);

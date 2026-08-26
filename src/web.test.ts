@@ -8,6 +8,7 @@ import {
   suggestParentDomain,
   isValidDomain,
   isValidDomainList,
+  secretsMatch,
 } from './web';
 import {
   availableLoginMethods,
@@ -363,5 +364,24 @@ describe('webhook signing (the integration contract)', () => {
     expect(verifySignature(secret, now, body, '', now)).toBe(false);
     expect(verifySignature(secret, now, body, 'sha256=zzzz', now)).toBe(false);
     expect(verifySignature('', now, body, 'sha256=aa', now)).toBe(false);
+  });
+});
+
+describe('secretsMatch', () => {
+  it('accepts an exact match and rejects anything else', () => {
+    expect(secretsMatch('s3cret', 's3cret')).toBe(true);
+    expect(secretsMatch('s3cret', 's3crea')).toBe(false);
+  });
+
+  // Hashing first is what lets differing lengths be compared at all —
+  // timingSafeEqual throws on a length mismatch.
+  it('handles differing lengths without throwing', () => {
+    expect(secretsMatch('short', 'a-much-longer-secret')).toBe(false);
+  });
+
+  it('never accepts an empty side, so an unset secret is not a skeleton key', () => {
+    expect(secretsMatch('', '')).toBe(false);
+    expect(secretsMatch('', 'x')).toBe(false);
+    expect(secretsMatch('x', '')).toBe(false);
   });
 });
