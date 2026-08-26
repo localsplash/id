@@ -55,9 +55,10 @@
 
     fetch('/api/providers')
       .then((r) => r.json())
-      .then(({ items }) => {
+      .then(({ items, unclaimed }) => {
         const wrap = document.getElementById('methods');
         if (!items.length) {
+          if (unclaimed) { location.href = '/setup'; return; }
           document.getElementById('noMethods').classList.remove('hidden');
           return;
         }
@@ -83,6 +84,7 @@
       sso_not_configured:       'ISP sign-in is not yet configured. Please contact support.',
       invalid_sso_code:         'The ISP sign-in link is invalid or expired. Please try again.',
       missing_sso_params:       'Incomplete sign-in link from your ISP portal.',
+      already_claimed:          'This service has already been set up — sign in normally.',
     };
     const err = new URLSearchParams(location.search).get('auth_error');
     if (err && errorMap[err]) {

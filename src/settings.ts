@@ -125,6 +125,16 @@ export class SettingsStore {
     return resp.json() as Promise<T>;
   }
 
+  /** True when an API token is present in the environment at all. */
+  isConfigured(): boolean {
+    return Boolean(this.config.NOCODB_API_TOKEN);
+  }
+
+  /** Cheap reachability/auth probe — throws when NocoDB cannot be used. */
+  async ping(): Promise<void> {
+    await this.api('GET', '/api/v2/meta/bases');
+  }
+
   /**
    * Find (or create) the base and table, seeding every known key so the
    * admin never has to guess what goes in the table. Safe to call more than

@@ -83,13 +83,28 @@ set** — an unconfigured provider simply does not appear on the login page.
 Settings are re-read at most every 30 seconds; changes in NocoDB take
 effect without a restart.
 
-### Bootstrap order (chicken & egg)
+### First-run setup wizard
 
-With an empty `oAuthConfig` there are no login methods, so nobody can reach
-`/admin`. That is by design: the first values are entered directly in the
-NocoDB UI at `nocodb.X.TLD` (set at minimum `PARENT_DOMAIN`,
-`APP_BASE_URL`, `ID_CLIENT_SECRET`, and one provider's credentials). After
-that, Super System Admins can manage everything from `/admin`.
+While no OAuth provider is configured, the instance is **unclaimed**: `/`
+redirects to `/setup`, a built-in wizard that walks the first admin through
+claiming it:
+
+1. It checks the NocoDB settings store first — if `NOCODB_API_TOKEN` (or
+   `NOCODB_BASE_URL`) is missing or wrong, the wizard says exactly that:
+   those two must be set in the environment before anything can be saved.
+2. The admin enters the parent domain (`X.TLD`) and credentials for
+   **Google or Microsoft** (the wizard is limited to providers that can
+   prove a domain; Microsoft additionally requires a tenant ID — `common`
+   cannot prove anything).
+3. The credentials are held in a short-lived cookie — *not* saved — while a
+   real OAuth round trip runs against them.
+4. Only if the sign-in works **and** the verified account is on the claimed
+   domain does the wizard persist everything to `oAuthConfig` (also minting
+   `ID_CLIENT_SECRET`), make the claimer Super System Admin, and land them
+   on `/admin`. A failed or off-domain attempt saves nothing.
+
+The wizard closes permanently the moment any provider is configured; later
+changes happen in `/admin` or directly in NocoDB at `nocodb.X.TLD`.
 
 ## Super System Admin
 

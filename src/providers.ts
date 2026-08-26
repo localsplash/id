@@ -24,8 +24,11 @@ export interface OAuthUserInfo {
 
 export interface OAuthState {
   csrf: string;
-  /** 'link' attaches the returning identity to an already-signed-in user. */
-  context: 'login' | 'link';
+  /**
+   * 'link' attaches the returning identity to an already-signed-in user;
+   * 'setup' is the first-run wizard verifying not-yet-saved credentials.
+   */
+  context: 'login' | 'link' | 'setup';
   provider: string;
   linkSessionId?: string;
 }
@@ -36,11 +39,13 @@ export interface ProviderDescriptor {
   /** oAuthConfig keys that must be non-empty for this provider to be offered. */
   requiredKeys: string[];
   /**
-   * Whether the provider cryptographically vouches for the email's domain.
-   * Only such providers can grant Super System Admin — an unverified email
-   * claim (e.g. Entra 'common') could be minted by any tenant on earth.
+   * Whether the provider vouches for the email's domain under the given
+   * settings. Only then can it grant Super System Admin — an unverified
+   * email claim could be minted by any tenant on earth. Google always
+   * verifies; Microsoft only when the app is locked to one tenant (with
+   * 'common' any directory could assert any address).
    */
-  verifiesEmailDomain: boolean;
+  verifiesEmailDomain(settings: Settings): boolean;
   buildAuthUrl(settings: Settings, baseUrl: string, encodedState: string): string;
   /** Exchange the callback `code` for the user's identity. */
   fetchUserInfo(settings: Settings, baseUrl: string, code: string): Promise<OAuthUserInfo | null>;
@@ -60,7 +65,7 @@ const google: ProviderDescriptor = {
   id: 'google',
   label: 'Google',
   requiredKeys: ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'],
-  verifiesEmailDomain: true,
+  verifiesEmailDomain: () => true,
 
   buildAuthUrl(settings, baseUrl, encodedState) {
     const params = new URLSearchParams({
@@ -152,11 +157,21 @@ export function parseMicrosoftIdToken(idToken: string): OAuthUserInfo | null {
   return { sub: claims.sub, email, name: claims.name ?? email };
 }
 
+/**
+ * A tenant GUID (or domain) locks sign-in to one directory, whose admin is
+ * the claiming organisation — addresses it asserts are then trustworthy.
+ * The multiplexed authorities are not.
+ */
+export function isTenantLocked(settings: Settings): boolean {
+  const tenant = (settings.MICROSOFT_TENANT || 'common').toLowerCase();
+  return !['common', 'organizations', 'consumers'].includes(tenant);
+}
+
 const microsoft: ProviderDescriptor = {
   id: 'microsoft',
   label: 'Microsoft',
   requiredKeys: ['MICROSOFT_CLIENT_ID', 'MICROSOFT_CLIENT_SECRET'],
-  verifiesEmailDomain: false,
+  verifiesEmailDomain: isTenantLocked,
 
   buildAuthUrl(settings, baseUrl, encodedState) {
     const params = new URLSearchParams({
@@ -247,7 +262,12 @@ export function isSuperAdmin(
   settings: Settings
 ): boolean {
   const domain = (settings.SUPERADMIN_DOMAIN || settings.PARENT_DOMAIN || '').toLowerCase();
-  if (!domain || !provider.verifiesEmailDomain) return false;
-  if (userInfo.hd?.toLowerCase() === domain) return true;
-  return userInfo.email.toLowerCase().endsWith(`@${domain}`);
+  if (!domain || !provider.verifiesEmailDomain(settings)) return false;
+  return emailMatchesDomain(userInfo, domain);
+}
+
+export function emailMatchesDomain(userInfo: OAuthUserInfo, domain: string): boolean {
+  const d = domain.toLowerCase();
+  if (userInfo.hd?.toLowerCase() === d) return true;
+  return userInfo.email.toLowerCase().endsWith(`@${d}`);
 }

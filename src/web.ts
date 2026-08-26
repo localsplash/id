@@ -154,6 +154,61 @@ export function getAuthRequestFromCookie(req: express.Request): AuthRequest | nu
   }
 }
 
+// ─── First-run setup wizard ──────────────────────────────────────────────────
+
+export const SETUP_COOKIE = 'id_setup';
+
+/**
+ * The wizard's pending claim: provider credentials the person typed, held in
+ * a short-lived HttpOnly cookie while the verification OAuth round trip runs.
+ * Nothing is written to the settings store until the round trip proves the
+ * credentials work AND the signed-in address is on the claimed domain.
+ */
+export interface SetupRequest {
+  csrf: string;
+  parentDomain: string;
+  appBaseUrl: string;
+  provider: 'google' | 'microsoft';
+  clientId: string;
+  clientSecret: string;
+  tenant?: string;
+}
+
+export function setSetupCookie(res: express.Response, setup: SetupRequest): void {
+  const encoded = Buffer.from(JSON.stringify(setup)).toString('base64url');
+  appendCookie(
+    res,
+    `${SETUP_COOKIE}=${encoded}; Path=/; Max-Age=600; HttpOnly; SameSite=Lax; Secure`
+  );
+}
+
+export function clearSetupCookie(res: express.Response): void {
+  appendCookie(res, `${SETUP_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure`);
+}
+
+export function getSetupFromCookie(req: express.Request): SetupRequest | null {
+  const raw = getCookie(req, SETUP_COOKIE);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as SetupRequest;
+    if (!parsed.csrf || !parsed.parentDomain || !parsed.provider || !parsed.clientId) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/** id.wisp.net → wisp.net; a bare or two-label host is returned unchanged. */
+export function suggestParentDomain(host: string): string {
+  const h = host.toLowerCase().split(':')[0];
+  const labels = h.split('.');
+  return labels.length > 2 ? labels.slice(1).join('.') : h;
+}
+
+export function isValidDomain(domain: string): boolean {
+  return /^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$/i.test(domain);
+}
+
 // ─── UISP bridge code verification ───────────────────────────────────────────
 
 export interface SsoPayload {

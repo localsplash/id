@@ -11,6 +11,7 @@ import {
   isProviderConfigured,
   availableLoginMethods,
   isSuperAdmin,
+  isTenantLocked,
   OAuthState,
   OAuthUserInfo,
   ProviderDescriptor,
@@ -29,6 +30,12 @@ import {
   getAuthRequestFromCookie,
   validateRedirectUri,
   verifySsoCode,
+  SetupRequest,
+  setSetupCookie,
+  clearSetupCookie,
+  getSetupFromCookie,
+  suggestParentDomain,
+  isValidDomain,
 } from './web';
 import * as store from './store';
 
@@ -147,25 +154,34 @@ export function buildApp() {
 
   /**
    * Map a provider identity onto an id user. Match by (provider, subject)
-   * first; when the provider vouches for the address (Google), fall back to
-   * matching an existing user by email so a person's Google and ISP logins
-   * converge on one account. Unverified addresses (Entra 'common') never
-   * auto-link — they create a fresh user unless linked explicitly from the
-   * account page.
+   * first; when the provider vouches for the address (trustEmail), fall
+   * back to matching an existing user by email so a person's different
+   * logins converge on one account. Unverified addresses never auto-link —
+   * they create a fresh user unless linked explicitly from the account page.
    */
   async function upsertUserForIdentity(
-    provider: ProviderDescriptor | { id: string; verifiesEmailDomain: boolean },
+    providerId: string,
+    trustEmail: boolean,
     userInfo: OAuthUserInfo
   ): Promise<number> {
-    let iUserId = await store.findUserByIdentity(db, provider.id, userInfo.sub);
-    if (!iUserId && provider.verifiesEmailDomain && userInfo.email) {
+    let iUserId = await store.findUserByIdentity(db, providerId, userInfo.sub);
+    if (!iUserId && trustEmail && userInfo.email) {
       iUserId = await store.findUserByEmail(db, userInfo.email);
     }
     if (!iUserId) {
       iUserId = await store.createUser(db, userInfo.email || null, userInfo.name || null);
     }
-    await store.ensureIdentity(db, iUserId, provider.id, userInfo.sub, userInfo.email || null);
+    await store.ensureIdentity(db, iUserId, providerId, userInfo.sub, userInfo.email || null);
     return iUserId;
+  }
+
+  /**
+   * "Unclaimed" = no OAuth provider has working config yet, so nobody can
+   * sign in and nobody is Super System Admin. In that state the first-run
+   * setup wizard is open; the moment one provider is configured it closes.
+   */
+  function isUnclaimed(settings: Settings): boolean {
+    return !PROVIDERS.some((p) => isProviderConfigured(p, settings));
   }
 
   // ── Basic pages ────────────────────────────────────────────────────────────
@@ -177,6 +193,8 @@ export function buildApp() {
   app.get('/', async (req, res) => {
     const session = await resolveSession(req);
     if (session) return res.redirect('/account');
+    const settings = await getSettings();
+    if (isUnclaimed(settings)) return res.redirect('/setup');
     return res.sendFile(path.join(publicDir, 'login.html'));
   });
 
@@ -196,8 +214,216 @@ export function buildApp() {
   // missing is absent — the login page renders only what can actually work.
   app.get('/api/providers', async (_req, res) => {
     const settings = await getSettings();
-    res.json({ items: availableLoginMethods(settings) });
+    res.json({ items: availableLoginMethods(settings), unclaimed: isUnclaimed(settings) });
   });
+
+  // ── First-run setup wizard ─────────────────────────────────────────────────
+
+  app.get('/setup', async (_req, res) => {
+    const settings = await getSettings();
+    if (!isUnclaimed(settings)) return res.redirect('/');
+    return res.sendFile(path.join(publicDir, 'setup.html'));
+  });
+
+  app.get('/api/setup/status', async (req, res) => {
+    settingsStore.invalidate();
+    const settings = await getSettings();
+
+    let nocodb: 'ok' | 'unconfigured' | 'unreachable' = 'ok';
+    let nocodbHint: string | undefined;
+    if (!settingsStore.isConfigured()) {
+      nocodb = 'unconfigured';
+      nocodbHint =
+        'NOCODB_API_TOKEN is not set. Generate an API token in NocoDB ' +
+        '(Account → Tokens) and set NOCODB_API_TOKEN (and NOCODB_BASE_URL) ' +
+        "in this app's environment, then restart it.";
+    } else {
+      try {
+        await settingsStore.ping();
+      } catch {
+        nocodb = 'unreachable';
+        nocodbHint =
+          `NocoDB at ${config.NOCODB_BASE_URL} did not accept the request. ` +
+          'Check NOCODB_BASE_URL and NOCODB_API_TOKEN in the environment.';
+      }
+    }
+
+    const base = baseUrl(settings, req);
+    return res.json({
+      unclaimed: isUnclaimed(settings),
+      nocodb,
+      nocodbHint,
+      suggested: {
+        parentDomain: settings.PARENT_DOMAIN ?? suggestParentDomain(String(req.headers.host ?? '')),
+        appBaseUrl: base,
+      },
+      callbackUrls: {
+        google: `${base}/auth/google/callback`,
+        microsoft: `${base}/auth/microsoft/callback`,
+      },
+    });
+  });
+
+  /**
+   * Step 2 of the wizard: hold the typed-in credentials in a short-lived
+   * cookie and send the person through a real OAuth round trip against
+   * them. Nothing touches the settings store yet — that happens in the
+   * callback, and only if the round trip works AND the signed-in address is
+   * provably on the claimed domain.
+   */
+  app.post('/api/setup/start', async (req, res, next) => {
+    try {
+      settingsStore.invalidate();
+      const settings = await getSettings();
+      if (!isUnclaimed(settings)) {
+        return res.status(409).json({ error: 'This instance is already set up.' });
+      }
+      if (!settingsStore.isConfigured()) {
+        return res.status(503).json({
+          error:
+            'NOCODB_API_TOKEN must be set in the environment before setup can save anything.',
+        });
+      }
+      try {
+        await settingsStore.ping();
+      } catch {
+        return res.status(503).json({
+          error: `NocoDB at ${config.NOCODB_BASE_URL} is unreachable or rejected the token — fix the environment first.`,
+        });
+      }
+
+      const body = (req.body ?? {}) as Record<string, string>;
+      const parentDomain = String(body.parentDomain ?? '').trim().toLowerCase();
+      const providerId = String(body.provider ?? '');
+      const clientId = String(body.clientId ?? '').trim();
+      const clientSecret = String(body.clientSecret ?? '').trim();
+      const tenant = String(body.tenant ?? '').trim();
+
+      if (!isValidDomain(parentDomain)) {
+        return res.status(400).json({ error: 'Enter a valid parent domain, e.g. example.com.' });
+      }
+      // The wizard is limited to providers that can prove the claimer's domain.
+      if (providerId !== 'google' && providerId !== 'microsoft') {
+        return res.status(400).json({ error: 'Setup supports Google or Microsoft only.' });
+      }
+      if (!clientId || !clientSecret) {
+        return res.status(400).json({ error: 'Client ID and client secret are required.' });
+      }
+      if (providerId === 'microsoft' && !isTenantLocked({ MICROSOFT_TENANT: tenant })) {
+        return res.status(400).json({
+          error:
+            "Microsoft setup needs your directory (tenant) ID — with 'common' any tenant " +
+            'could assert an address on your domain, so it cannot prove the claim.',
+        });
+      }
+
+      const setup: SetupRequest = {
+        csrf: store.generateId(16),
+        parentDomain,
+        appBaseUrl: baseUrl(settings, req),
+        provider: providerId,
+        clientId,
+        clientSecret,
+        tenant: tenant || undefined,
+      };
+      setSetupCookie(res, setup);
+
+      const state: OAuthState = { csrf: setup.csrf, context: 'setup', provider: providerId };
+      setOAuthStateCookie(res, state);
+
+      const provider = getProvider(providerId)!;
+      const candidate = candidateSettings(setup);
+      return res.json({
+        authUrl: provider.buildAuthUrl(
+          candidate,
+          setup.appBaseUrl,
+          Buffer.from(JSON.stringify(state)).toString('base64url')
+        ),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** The settings the wizard is proposing, before anything is saved. */
+  function candidateSettings(setup: SetupRequest): Settings {
+    const candidate: Settings = {
+      PARENT_DOMAIN: setup.parentDomain,
+      APP_BASE_URL: setup.appBaseUrl,
+    };
+    if (setup.provider === 'google') {
+      candidate.GOOGLE_CLIENT_ID = setup.clientId;
+      candidate.GOOGLE_CLIENT_SECRET = setup.clientSecret;
+    } else {
+      candidate.MICROSOFT_CLIENT_ID = setup.clientId;
+      candidate.MICROSOFT_CLIENT_SECRET = setup.clientSecret;
+      candidate.MICROSOFT_TENANT = setup.tenant ?? 'common';
+    }
+    return candidate;
+  }
+
+  /**
+   * Finish the claim: the round trip came back, so the credentials work.
+   * The claim itself holds only if the person who signed in would be Super
+   * System Admin under the very settings being proposed — same rule, same
+   * code path, as every later login.
+   */
+  async function handleSetupCallback(
+    req: express.Request,
+    res: express.Response,
+    provider: ProviderDescriptor,
+    stored: OAuthState
+  ): Promise<string> {
+    clearSetupCookie(res);
+
+    settingsStore.invalidate();
+    const current = await getSettings();
+    if (!isUnclaimed(current)) return '/?auth_error=already_claimed';
+
+    const setup = getSetupFromCookie(req);
+    if (!setup || setup.csrf !== stored.csrf || setup.provider !== provider.id) {
+      return '/setup?error=state';
+    }
+
+    const returned = decodeState(String(req.query.state ?? ''));
+    if (!returned || returned.csrf !== stored.csrf) return '/setup?error=state';
+    if (req.query.error) return '/setup?error=denied';
+    const code = String(req.query.code ?? '');
+    if (!code) return '/setup?error=denied';
+
+    const candidate = candidateSettings(setup);
+    const userInfo = await provider.fetchUserInfo(candidate, setup.appBaseUrl, code);
+    if (!userInfo?.sub) return '/setup?error=verify_failed';
+
+    if (!isSuperAdmin(provider, userInfo, candidate)) {
+      return `/setup?error=domain_mismatch&domain=${encodeURIComponent(setup.parentDomain)}`;
+    }
+
+    // Verified: persist the claim. bootstrap() seeds the full key menu; the
+    // exchange secret is minted here so apps have one from day one.
+    await settingsStore.bootstrap();
+    for (const [key, value] of Object.entries(candidate)) {
+      await settingsStore.set(key, value);
+    }
+    if (!current.ID_CLIENT_SECRET) {
+      await settingsStore.set('ID_CLIENT_SECRET', store.generateId(32));
+    }
+    settingsStore.invalidate();
+
+    const iUserId = await upsertUserForIdentity(provider.id, true, userInfo);
+    logger.warn(
+      `[setup] instance claimed for ${setup.parentDomain} by ${userInfo.email} via ${provider.id}`
+    );
+
+    const dest = await finishLogin(req, res, await getSettings(), {
+      iUserId,
+      provider: provider.id,
+      subject: userInfo.sub,
+      superAdmin: true,
+    });
+    // A pending app request still wins; otherwise land on the admin console.
+    return dest === '/account' ? '/admin?setup=complete' : dest;
+  }
 
   // ── Application entry: /authorize ──────────────────────────────────────────
 
@@ -303,13 +529,7 @@ export function buildApp() {
       clearOAuthStateCookie(res);
       const settings = await getSettings();
       const provider = getProvider(req.params.provider);
-      if (!provider || !isProviderConfigured(provider, settings)) {
-        return res.redirect('/?auth_error=provider_not_configured');
-      }
-
-      if (req.query.error) return res.redirect('/?auth_error=provider_denied');
-      const code = String(req.query.code ?? '');
-      if (!code) return res.redirect('/?auth_error=missing_code');
+      if (!provider) return res.redirect('/?auth_error=provider_not_configured');
 
       // CSRF: the state echoed by the provider must match the cookie we set
       // when we left, and must have been minted for this provider.
@@ -318,6 +538,21 @@ export function buildApp() {
       if (!stored || stored.provider !== provider.id) {
         return res.redirect('/?auth_error=invalid_state');
       }
+
+      // The setup wizard verifies credentials that are not saved yet, so it
+      // runs before the is-this-provider-configured gate.
+      if (stored.context === 'setup') {
+        return res.redirect(await handleSetupCallback(req, res, provider, stored));
+      }
+
+      if (!isProviderConfigured(provider, settings)) {
+        return res.redirect('/?auth_error=provider_not_configured');
+      }
+
+      if (req.query.error) return res.redirect('/?auth_error=provider_denied');
+      const code = String(req.query.code ?? '');
+      if (!code) return res.redirect('/?auth_error=missing_code');
+
       const returned = decodeState(String(req.query.state ?? ''));
       if (!returned || stored.csrf !== returned.csrf) {
         return res.redirect('/?auth_error=csrf_mismatch');
@@ -345,7 +580,11 @@ export function buildApp() {
       }
 
       // ── Login context ────────────────────────────────────────────────────
-      const iUserId = await upsertUserForIdentity(provider, userInfo);
+      const iUserId = await upsertUserForIdentity(
+        provider.id,
+        provider.verifiesEmailDomain(settings),
+        userInfo
+      );
       const superAdmin = isSuperAdmin(provider, userInfo, settings);
       const dest = await finishLogin(req, res, settings, {
         iUserId,
@@ -412,10 +651,11 @@ export function buildApp() {
         }
       }
 
-      const iUserId = await upsertUserForIdentity(
-        { id: 'uisp', verifiesEmailDomain: false },
-        { sub: payload.clientId, email: email ?? '', name: name ?? `ISP client ${payload.clientId}` }
-      );
+      const iUserId = await upsertUserForIdentity('uisp', false, {
+        sub: payload.clientId,
+        email: email ?? '',
+        name: name ?? `ISP client ${payload.clientId}`,
+      });
 
       const dest = await finishLogin(req, res, settings, {
         iUserId,
@@ -539,7 +779,9 @@ export function buildApp() {
   });
 
   // Revoke this session (sign out of id — apps keep their own sessions).
-  app.post('/logout', async (req, res, next) => {
+  // GET is accepted too: applications end their own session and then send
+  // the browser here so "sign out" ends the domain-wide login as well.
+  const logoutHandler: express.RequestHandler = async (req, res, next) => {
     try {
       const settings = await getSettings();
       const session = await resolveSession(req);
@@ -549,7 +791,9 @@ export function buildApp() {
     } catch (err) {
       next(err);
     }
-  });
+  };
+  app.post('/logout', logoutHandler);
+  app.get('/logout', logoutHandler);
 
   // Revoke every session for this user, everywhere.
   app.post('/api/logout-everywhere', async (req, res, next) => {

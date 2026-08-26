@@ -1,9 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import crypto from 'crypto';
-import { validateRedirectUri, verifySsoCode, encodeState, decodeState } from './web';
+import {
+  validateRedirectUri,
+  verifySsoCode,
+  encodeState,
+  decodeState,
+  suggestParentDomain,
+  isValidDomain,
+} from './web';
 import {
   availableLoginMethods,
   isSuperAdmin,
+  isTenantLocked,
   parseMicrosoftIdToken,
   getProvider,
 } from './providers';
@@ -117,10 +125,27 @@ describe('isSuperAdmin', () => {
     ).toBe(true);
   });
 
-  it('never grants via a provider that does not verify the domain', () => {
+  it("never grants via Microsoft on a multiplexed authority ('common')", () => {
     expect(
       isSuperAdmin(microsoft, { sub: 's', email: 'a@wisp.net', name: 'A' }, settings)
     ).toBe(false);
+    expect(
+      isSuperAdmin(
+        microsoft,
+        { sub: 's', email: 'a@wisp.net', name: 'A' },
+        { ...settings, MICROSOFT_TENANT: 'organizations' }
+      )
+    ).toBe(false);
+  });
+
+  it('grants via Microsoft when the app is locked to one tenant', () => {
+    expect(
+      isSuperAdmin(
+        microsoft,
+        { sub: 's', email: 'a@wisp.net', name: 'A' },
+        { ...settings, MICROSOFT_TENANT: 'a2b4c6d8-0000-0000-0000-000000000000' }
+      )
+    ).toBe(true);
   });
 
   it('honours SUPERADMIN_DOMAIN over PARENT_DOMAIN', () => {
@@ -151,6 +176,33 @@ describe('parseMicrosoftIdToken', () => {
     expect(parseMicrosoftIdToken(idToken({ sub: 's', name: 'No Mail' }))).toBeNull();
     expect(parseMicrosoftIdToken(idToken({ email: 'a@b.c' }))).toBeNull();
     expect(parseMicrosoftIdToken('not-a-jwt')).toBeNull();
+  });
+});
+
+describe('isTenantLocked', () => {
+  it('treats only a real tenant as locked', () => {
+    expect(isTenantLocked({})).toBe(false);
+    expect(isTenantLocked({ MICROSOFT_TENANT: 'common' })).toBe(false);
+    expect(isTenantLocked({ MICROSOFT_TENANT: 'consumers' })).toBe(false);
+    expect(isTenantLocked({ MICROSOFT_TENANT: 'a2b4c6d8-1111-2222-3333-444455556666' })).toBe(true);
+    expect(isTenantLocked({ MICROSOFT_TENANT: 'contoso.onmicrosoft.com' })).toBe(true);
+  });
+});
+
+describe('setup wizard helpers', () => {
+  it('suggests the parent domain by stripping the app label', () => {
+    expect(suggestParentDomain('id.wisp.net')).toBe('wisp.net');
+    expect(suggestParentDomain('id.dev.localsplash.ai')).toBe('dev.localsplash.ai');
+    expect(suggestParentDomain('wisp.net')).toBe('wisp.net');
+    expect(suggestParentDomain('id.wisp.net:3200')).toBe('wisp.net');
+  });
+
+  it('validates domains', () => {
+    expect(isValidDomain('wisp.net')).toBe(true);
+    expect(isValidDomain('a.b.example.com')).toBe(true);
+    expect(isValidDomain('not a domain')).toBe(false);
+    expect(isValidDomain('nodots')).toBe(false);
+    expect(isValidDomain('-bad.com')).toBe(false);
   });
 });
 
