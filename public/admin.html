@@ -49,6 +49,52 @@
       <div id="config" class="space-y-3"></div>
     </div>
 
+    <!-- Application integrations -->
+    <div class="bg-white rounded-2xl shadow p-6 mb-6">
+      <div class="flex items-start justify-between mb-1">
+        <h2 class="text-sm font-semibold text-slate-700">Application integrations</h2>
+        <button id="toggleSpec" class="text-xs font-medium text-blue-600 hover:text-blue-700">
+          Show the integration contract
+        </button>
+      </div>
+      <p class="text-xs text-slate-500 mb-4">
+        Apps register one endpoint and id pushes signed events to it — no polling,
+        no cron. Sessions in each app are independent of the id session, so an app
+        that is not listening will keep people signed in after you revoke them here.
+      </p>
+
+      <div id="spec" class="hidden mb-4 rounded-xl bg-slate-50 border border-slate-200 p-4 text-xs text-slate-600 space-y-2">
+        <p class="font-semibold text-slate-700">On boot, each app calls:</p>
+        <pre class="bg-white rounded-lg p-2 overflow-x-auto">POST /api/apps/register
+{ "client_secret": "&lt;ID_CLIENT_SECRET&gt;",
+  "name": "EchoWeb",
+  "webhook_url": "https://app.&lt;parent-domain&gt;/id/events" }
+
+→ { "secret": "…", "events": [ … ] }</pre>
+        <p class="font-semibold text-slate-700">id then POSTs each event to that URL:</p>
+        <pre class="bg-white rounded-lg p-2 overflow-x-auto">X-Id-Event: session.revoked
+X-Id-Event-Id: 1234
+X-Id-Timestamp: 1774500000
+X-Id-Signature: sha256=&lt;hex&gt;
+
+{ "id": 1234, "type": "session.revoked",
+  "occurredAt": "…", "data": { "iUserId": 7, "scope": "all" } }</pre>
+        <p>
+          The signature is <span class="font-mono">HMAC-SHA256(secret, `${timestamp}.${rawBody}`)</span>.
+          Receivers must verify against the <em>raw</em> body, reject a timestamp more
+          than 300s off, compare in constant time, and answer 2xx only once the event
+          is durably handled — retries mean handlers must be idempotent.
+        </p>
+        <p>
+          Missed events (app down past the retry schedule) are caught up once at boot
+          via <span class="font-mono">GET /api/events?since=&lt;lastEventId&gt;</span>.
+        </p>
+        <p id="specEvents" class="text-slate-500"></p>
+      </div>
+
+      <div id="apps" class="space-y-3"></div>
+    </div>
+
     <!-- Users -->
     <div class="bg-white rounded-2xl shadow p-6">
       <h2 class="text-sm font-semibold text-slate-700 mb-4">Users & sessions</h2>
@@ -59,6 +105,12 @@
 
   <script>
     const SECRET_RE = /(SECRET|KEY|TOKEN|PASSWORD)/i;
+
+    // Origins, endpoint URLs and provider error strings all end up in
+    // innerHTML below, and none of them are ours to trust.
+    const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
+      { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
+    ));
 
     function banner(text, ok) {
       const el = document.getElementById('banner');
@@ -116,8 +168,8 @@
         div.className = 'flex flex-col sm:flex-row sm:items-center gap-2';
         div.innerHTML = `
           <div class="sm:w-64 flex-shrink-0">
-            <span class="text-sm font-medium text-slate-700 font-mono">${row.key}</span>
-            <span class="block text-[11px] text-slate-400 leading-tight">${row.description || ''}</span>
+            <span class="text-sm font-medium text-slate-700 font-mono">${esc(row.key)}</span>
+            <span class="block text-[11px] text-slate-400 leading-tight">${esc(row.description || '')}</span>
           </div>`;
         const input = document.createElement('input');
         input.type = secret ? 'password' : 'text';
@@ -154,7 +206,7 @@
         const head = document.createElement('div');
         head.className = 'flex items-center justify-between mb-2';
         head.innerHTML = `<div>
-            <span class="text-sm font-medium text-slate-800">${u.displayName || u.email || 'User ' + u.iUserId}</span>
+            <span class="text-sm font-medium text-slate-800">${esc(u.displayName || u.email || 'User ' + u.iUserId)}</span>
             <span class="text-xs text-slate-400 ml-2">#${u.iUserId}</span>
           </div>
           <span class="text-xs text-slate-500">${u.activeSessions} active session(s)</span>`;
@@ -163,7 +215,7 @@
         for (const i of u.identities) {
           const row = document.createElement('div');
           row.className = 'flex items-center justify-between text-xs text-slate-600 py-1';
-          row.innerHTML = `<span class="font-mono">${i.provider} · ${i.email || i.subject}</span>`;
+          row.innerHTML = `<span class="font-mono">${esc(i.provider)} · ${esc(i.email || i.subject)}</span>`;
           const unlink = document.createElement('button');
           unlink.textContent = 'Unlink';
           unlink.className = 'text-red-500 hover:text-red-700';
@@ -176,6 +228,33 @@
           row.appendChild(unlink);
           div.appendChild(row);
         }
+
+        // Remapping: fold a duplicate id user into the one to keep. Apps are
+        // told via user.merged so their local mapping follows.
+        const merge = document.createElement('button');
+        merge.textContent = 'Merge into…';
+        merge.className = 'mt-2 mr-3 text-xs text-slate-500 hover:text-slate-700 font-medium';
+        merge.onclick = async () => {
+          const into = prompt(
+            `Fold user #${u.iUserId} into which user id?\n\n` +
+            'Their login methods move to that user, their sessions end, and every ' +
+            'app is told to repoint its local mapping.'
+          );
+          if (!into) return;
+          const r = await fetch(`/api/admin/users/${u.iUserId}/merge`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ intoUserId: Number(into) }),
+          });
+          const body = await r.json().catch(() => ({}));
+          banner(
+            r.ok ? `Merged: ${body.movedIdentities} login method(s) moved.` : body.error || 'Merge failed.',
+            r.ok
+          );
+          loadUsers();
+          loadApps();
+        };
+        div.appendChild(merge);
 
         if (u.activeSessions > 0) {
           const revoke = document.createElement('button');
@@ -193,7 +272,86 @@
       }
     }
 
+    const STATUS_STYLE = {
+      listening:      ['bg-green-50 text-green-700 border-green-200', 'Listening'],
+      unverified:     ['bg-amber-50 text-amber-700 border-amber-200', 'Registered, unverified'],
+      failing:        ['bg-red-50 text-red-700 border-red-200', 'Not listening'],
+      not_integrated: ['bg-red-50 text-red-700 border-red-200', 'Not integrated'],
+    };
+    const STATUS_NOTE = {
+      listening: 'Deliveries are succeeding.',
+      unverified: 'Registered, but nothing has been delivered successfully yet.',
+      failing: 'Deliveries are failing — revocations are NOT reaching this app.',
+      not_integrated:
+        'This app signs users in but has never registered a webhook, so it will not ' +
+        'act on revocations. Add the receiver endpoint and restart it.',
+    };
+
+    const fmt = (t) => (t ? new Date(t).toLocaleString() : '—');
+
+    async function loadApps() {
+      const resp = await fetch('/api/admin/apps');
+      if (!resp.ok) return;
+      const { items, eventTypes } = await resp.json();
+      document.getElementById('specEvents').textContent =
+        'Event types: ' + (eventTypes || []).join(', ');
+
+      const wrap = document.getElementById('apps');
+      wrap.innerHTML = '';
+      if (!items.length) {
+        wrap.innerHTML =
+          '<div class="text-sm text-slate-400">No applications have signed anyone in yet.</div>';
+        return;
+      }
+      for (const a of items) {
+        const [style, label] = STATUS_STYLE[a.status] || STATUS_STYLE.not_integrated;
+        const div = document.createElement('div');
+        div.className = 'rounded-xl border border-slate-200 p-4';
+        div.innerHTML = `
+          <div class="flex items-center justify-between gap-3 mb-1">
+            <div class="min-w-0">
+              <span class="text-sm font-medium text-slate-800">${esc(a.sName || a.sOrigin)}</span>
+              <span class="block text-[11px] text-slate-400 font-mono truncate">${esc(a.sOrigin)}</span>
+            </div>
+            <span class="px-2 py-0.5 rounded-md text-[11px] font-semibold border ${style} flex-shrink-0">${label}</span>
+          </div>
+          <p class="text-[11px] text-slate-500 mb-2">${esc(STATUS_NOTE[a.status] || '')}</p>
+          <div class="text-[11px] text-slate-400 space-y-0.5">
+            <div>Endpoint: <span class="font-mono">${esc(a.sWebhookUrl || 'not registered')}</span></div>
+            <div>Last login handoff: ${fmt(a.dtLastTokenExchange)} · Last delivery: ${fmt(a.dtLastDeliveryOk)}</div>
+            ${a.pending || a.abandoned
+              ? `<div class="text-amber-600">${a.pending} queued${a.abandoned ? `, ${a.abandoned} given up on` : ''}</div>`
+              : ''}
+            ${a.sLastError ? `<div class="text-red-600">Last error: ${esc(a.sLastError)}</div>` : ''}
+          </div>`;
+        if (a.sWebhookUrl) {
+          const ping = document.createElement('button');
+          ping.textContent = 'Send test event';
+          ping.className = 'mt-2 text-xs text-blue-600 hover:text-blue-800 font-medium';
+          ping.onclick = async () => {
+            const r = await fetch('/api/admin/apps/ping', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ origin: a.sOrigin }),
+            });
+            banner(r.ok ? 'Test event queued — refresh in a moment.' : 'Could not queue it.', r.ok);
+            setTimeout(loadApps, 6000);
+          };
+          div.appendChild(ping);
+        }
+        wrap.appendChild(div);
+      }
+    }
+
+    document.getElementById('toggleSpec').onclick = () => {
+      const el = document.getElementById('spec');
+      const hidden = el.classList.toggle('hidden');
+      document.getElementById('toggleSpec').textContent =
+        hidden ? 'Show the integration contract' : 'Hide the integration contract';
+    };
+
     loadConfig();
+    loadApps();
     loadUsers();
   </script>
 </body>
