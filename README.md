@@ -61,7 +61,8 @@ user entered straight from the portal.
 ## Configuration
 
 The `.env` carries **only** bootstrap plumbing: MySQL and NocoDB
-coordinates (see `.env.example`). Every application-level setting lives in
+coordinates, plus `AIDA_APP_PRIVATE_KEY` (see `.env.example` and
+[docs/service-auth.md](docs/service-auth.md)). Every application-level setting lives in
 the **`oAuthConfig` table** in NocoDB at `nocodb.X.TLD`:
 
 | Key | Purpose |
@@ -90,6 +91,36 @@ set** — an unconfigured provider simply does not appear on the login page.
 
 Settings are re-read at most every 30 seconds; changes in NocoDB take
 effect without a restart.
+
+## Service-to-service authentication
+
+Other Aida services authenticate to `id` — and `id` to them — with Ed25519
+signatures rather than shared secrets. Each application publishes its public
+key to `aida_application` in the same shared base, so N services need N
+published keys rather than N² pasted secrets, and the registry holds nothing
+secret at rest.
+
+The private key is `AIDA_APP_PRIVATE_KEY`, base64 of the PKCS#8 DER on one
+line. Generate one with `npm run keygen`. **It is required in production** —
+the process refuses to start without it rather than improvising a key that
+would leave this service callable by nobody. In development an ephemeral key
+is generated with a warning.
+
+**Changing the service key signs nobody out.** A user session is 32 random
+bytes in `id_tbl_Session`, checked by row lookup; nothing about it is derived
+from or verified against this key. Rotation is an ordinary config change.
+
+`GET /readyz` answers whether peers can actually call this service — separate
+from `/healthz`, which only says the process is up. When it is unhappy it
+names the failure category and the NocoDB row to open, so an incident starts
+with one HTTP call rather than a log dive. `GET /internal/v1/whoami` is the
+conformance target for a peer checking its own signing.
+
+The full contract — headers, canonical signing string, verification order,
+rotation, and the registry schema — is in
+[docs/service-auth.md](docs/service-auth.md). The design settled the algorithm
+and key encoding but not the wire format, so this service defines it and is
+its first implementation; a peer that follows that page will interoperate.
 
 ### First-run setup wizard
 

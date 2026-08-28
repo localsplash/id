@@ -143,4 +143,15 @@ export async function ensureSchema(pool: mysql.Pool): Promise<void> {
       INDEX idx_nonce_expires (dtExpires)
     ) ENGINE=InnoDB
   `);
+  // Single-use nonces from signed service-to-service calls. Shared storage
+  // rather than per-process memory, because replicas must not each accept the
+  // same replayed request once.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS id_tbl_AidaNonce (
+      sNonce    VARCHAR(128) PRIMARY KEY,
+      dtExpires DATETIME(3) NOT NULL,
+      dtCreated DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      INDEX idx_aida_nonce_expires (dtExpires)
+    ) ENGINE=InnoDB
+  `);
 }
