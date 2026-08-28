@@ -26,9 +26,12 @@ const envSchema = z.object({
   // the API token is generated in the NocoDB UI (Account → Tokens).
   NOCODB_BASE_URL: z.string().url().default('http://nocodb:8080'),
   NOCODB_API_TOKEN: z.string().default(''),
-  // Base (project) and table the settings live in. Auto-created on first
-  // boot if the token has creator rights.
-  NOCODB_BASE_NAME: z.string().default('id'),
+  // AidaOffice is the one base every Aida project shares — NocoDB link fields
+  // resolve only within a base, so a shared base is what lets these settings
+  // relate to the tables other projects own. The base no longer says whose data
+  // it is; NOCODB_TABLE_NAME does. Both are auto-created on first boot if the
+  // token has creator rights.
+  NOCODB_BASE_NAME: z.string().default('AidaOffice'),
   NOCODB_TABLE_NAME: z.string().default('oAuthConfig'),
 });
 
