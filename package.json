@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "keygen": "tsx scripts/keygen.ts"
   },
   "keywords": [],
   "author": "",

@@ -43,6 +43,11 @@ import {
 } from './web';
 import * as store from './store';
 import { emitEvent, FAILING_THRESHOLD, EVENT_TYPES } from './webhooks';
+import { loadServiceKey } from './aida/keys';
+import { AidaRegistry } from './aida/registry';
+import { NocoRegistryBackend, APPLICATION_TABLE } from './aida/nocodbBackend';
+import { AidaService } from './aida/service';
+import { MysqlNonceStore } from './aida/nonceStore';
 
 const publicDir = path.join(__dirname, '..', 'public');
 
@@ -50,10 +55,77 @@ export function buildApp() {
   const config = loadConfig();
   const db = getDb(config);
   const settingsStore = new SettingsStore(config);
-  const logger = pino({ level: config.LOG_LEVEL });
+  const logger = pino({
+    level: config.LOG_LEVEL,
+    // Secrets must not reach a log line even when something logs a whole
+    // config or request object by accident. AIDA_APP_PRIVATE_KEY is the one
+    // that matters most here — it is this service's identity to its peers —
+    // but the same discipline covers the others.
+    redact: {
+      paths: [
+        'AIDA_APP_PRIVATE_KEY',
+        '*.AIDA_APP_PRIVATE_KEY',
+        'config.AIDA_APP_PRIVATE_KEY',
+        'NOCODB_API_TOKEN',
+        '*.NOCODB_API_TOKEN',
+        'client_secret',
+        '*.client_secret',
+        'req.headers.cookie',
+        'req.headers.authorization',
+      ],
+      censor: '[redacted]',
+    },
+  });
   const app = express();
 
-  app.use(express.json({ limit: '256kb' }));
+  /**
+   * Service identity. Absent in production this throws and the process never
+   * starts, which is the intended behaviour: an identity service with an
+   * improvised service key would be callable by nobody and diagnosable by
+   * no one. Registration itself happens in server.ts, off the constructor,
+   * so an unreachable NocoDB leaves this service unready rather than dead.
+   */
+  const serviceKey = loadServiceKey(config.AIDA_APP_PRIVATE_KEY, config.NODE_ENV, (msg) =>
+    logger.warn(msg)
+  );
+  const aidaService = new AidaService({
+    key: serviceKey,
+    registry: new AidaRegistry(new NocoRegistryBackend(config)),
+    nonces: new MysqlNonceStore(db),
+    application: config.AIDA_APP_NAME,
+    environment: config.AIDA_ENVIRONMENT,
+    baseName: config.NOCODB_BASE_NAME,
+    applicationTable: APPLICATION_TABLE,
+    logger,
+  });
+
+  // Signed service calls are verified over the exact bytes received, so the
+  // raw body is kept alongside the parsed one. Re-serialising req.body would
+  // not reproduce the caller's byte order or spacing, and every signature
+  // would fail for reasons nobody could see.
+  //
+  // /internal takes its body raw whatever the content type. Relying on the
+  // JSON parser's hook would silently produce an empty rawBody for any other
+  // type, and every such call would fail its signature with nothing in the
+  // request to explain why.
+  app.use(
+    '/internal',
+    express.raw({ type: () => true, limit: '256kb' }),
+    (req, _res, next) => {
+      (req as { rawBody?: Buffer }).rawBody = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.alloc(0);
+      next();
+    }
+  );
+  app.use(
+    express.json({
+      limit: '256kb',
+      verify: (req, _res, buf) => {
+        (req as { rawBody?: Buffer }).rawBody = Buffer.from(buf);
+      },
+    })
+  );
   app.use(express.urlencoded({ extended: false }));
   app.use(pinoHttp({ logger }));
   app.use(express.static(publicDir, { index: false }));
@@ -193,6 +265,34 @@ export function buildApp() {
 
   app.get('/healthz', (_req, res) => {
     res.json({ ok: true, service: 'id' });
+  });
+
+  /**
+   * Liveness says the process is up; readiness says peers can actually call
+   * it. They differ here, and the difference is the point: this service is on
+   * the authentication path, so "why is sign-in failing" has to be answerable
+   * from one HTTP call during an incident rather than a log dive. The body
+   * names the failure category and the NocoDB row to open.
+   *
+   * Unauthenticated on purpose — it carries no secret, only a public key
+   * version and a row reference — and it is what an orchestrator polls.
+   */
+  app.get('/readyz', (_req, res) => {
+    const status = aidaService.getStatus();
+    res.status(status.ready ? 200 : 503).json(status);
+  });
+
+  /**
+   * The conformance target for signed service-to-service calls. A peer that
+   * gets 200 here has its signing right; everything else under /internal/v1
+   * uses the same guard. See docs/service-auth.md.
+   */
+  app.get('/internal/v1/whoami', aidaService.requireSignedCaller(), (req, res) => {
+    res.json({
+      caller: (req as { aidaCaller?: unknown }).aidaCaller,
+      service: config.AIDA_APP_NAME,
+      environment: config.AIDA_ENVIRONMENT,
+    });
   });
 
   app.get('/', async (req, res) => {
@@ -1212,5 +1312,5 @@ export function buildApp() {
     }
   );
 
-  return { app, db, settingsStore };
+  return { app, db, settingsStore, aidaService };
 }
