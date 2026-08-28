@@ -61,9 +61,8 @@ user entered straight from the portal.
 ## Configuration
 
 The `.env` carries **only** bootstrap plumbing: MySQL and NocoDB
-coordinates, plus `AIDA_APP_PRIVATE_KEY` (see `.env.example` and
-[docs/service-auth.md](docs/service-auth.md)). Every application-level setting lives in
-the **`oAuthConfig` table** in NocoDB at `nocodb.X.TLD`:
+coordinates (see `.env.example`). Every application-level setting lives in
+the **`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`:
 
 | Key | Purpose |
 | --- | --- |
@@ -76,51 +75,13 @@ the **`oAuthConfig` table** in NocoDB at `nocodb.X.TLD`:
 | `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` / `MICROSOFT_TENANT` | Microsoft Entra ID OAuth |
 | `UISP_SSO_SECRET` / `UISP_PLUGIN_URL` / `UISP_BASE_URL` / `UISP_CRM_APP_KEY_READ` | UISP bridge & CRM |
 
-That table lives in **`AidaOffice`**, the one base every Aida project shares.
-NocoDB link fields resolve only within a base, so sharing one is what lets these
-settings relate to the tables the other projects own — AidaControl's tenant
-tables, AidaAdmin's `appConfig`. The base no longer says whose data it is; the
-table title does, and `oAuthConfig` is this project's.
-
-On first boot `id` creates the base and table and seeds every known key with an
+On first boot `id` creates the base/table and seeds every known key with an
 empty value and a description, so the menu of settings is visible without
-guessing. Creating the base logs a warning: on a first boot that is expected,
-but anywhere else it means `NOCODB_BASE_NAME` is wrong and this service is about
-to write settings into a base nothing else reads. **A login method is only offered when all of its required keys are
+guessing. **A login method is only offered when all of its required keys are
 set** — an unconfigured provider simply does not appear on the login page.
 
 Settings are re-read at most every 30 seconds; changes in NocoDB take
 effect without a restart.
-
-## Service-to-service authentication
-
-Other Aida services authenticate to `id` — and `id` to them — with Ed25519
-signatures rather than shared secrets. Each application publishes its public
-key to `aida_application` in the same shared base, so N services need N
-published keys rather than N² pasted secrets, and the registry holds nothing
-secret at rest.
-
-The private key is `AIDA_APP_PRIVATE_KEY`, base64 of the PKCS#8 DER on one
-line. Generate one with `npm run keygen`. **It is required in production** —
-the process refuses to start without it rather than improvising a key that
-would leave this service callable by nobody. In development an ephemeral key
-is generated with a warning.
-
-**Changing the service key signs nobody out.** A user session is 32 random
-bytes in `id_tbl_Session`, checked by row lookup; nothing about it is derived
-from or verified against this key. Rotation is an ordinary config change.
-
-`GET /readyz` answers whether peers can actually call this service — separate
-from `/healthz`, which only says the process is up. When it is unhappy it
-names the failure category and the NocoDB row to open, so an incident starts
-with one HTTP call rather than a log dive. `GET /internal/v1/whoami` is the
-conformance target for a peer checking its own signing.
-
-The full contract — headers, canonical signing string, verification order,
-rotation, and the registry schema — is in
-[docs/service-auth.md](docs/service-auth.md). The design settled the algorithm
-and key encoding but not the wire format, so this service defines it and is
-its first implementation; a peer that follows that page will interoperate.
 
 ### First-run setup wizard
 

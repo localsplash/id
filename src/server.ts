@@ -5,7 +5,7 @@ import { drainDeliveries } from './webhooks';
 
 async function main() {
   const config = loadConfig();
-  const { app, db, settingsStore, aidaService } = buildApp();
+  const { app, db, settingsStore } = buildApp();
 
   // Identity tables (idempotent; canonical copy lives in EchoDatabase/init).
   await ensureSchema(db);
@@ -19,22 +19,6 @@ async function main() {
   } catch (err) {
     console.warn(`[settings] NocoDB bootstrap failed (will retry on demand): ${String(err)}`);
   }
-
-  // Publish this service's public key to `aida_application` and keep
-  // last_seen_at fresh. Deliberately not awaited: a NocoDB that is slow or
-  // unreachable must not hold up the listener. Until it succeeds /readyz
-  // reports unready with the reason, which is the honest state — the process
-  // is up, peers cannot yet verify it.
-  const registerTick = async () => {
-    try {
-      await aidaService.register();
-    } catch (err) {
-      console.error(`[aida] registration pass failed: ${String(err)}`);
-    }
-  };
-  const registration = setInterval(() => void registerTick(), 60_000);
-  registration.unref();
-  void registerTick();
 
   // Webhook delivery ticker. Deliveries are durable rows, so this is a
   // drain loop rather than a scheduler: a restart mid-retry resumes here,

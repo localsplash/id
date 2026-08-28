@@ -12,12 +12,6 @@ services:
       DB_NAME: ${DB_NAME:-id_db}
       NOCODB_BASE_URL: ${NOCODB_BASE_URL:-http://host.docker.internal:18090}
       NOCODB_API_TOKEN: ${NOCODB_API_TOKEN:-}
-      # The image sets NODE_ENV=production, so this is required: the app
-      # refuses to start without it rather than improvising a service key.
-      # Generate one with `npm run keygen` and put it in .env.
-      AIDA_APP_PRIVATE_KEY: ${AIDA_APP_PRIVATE_KEY:-}
-      AIDA_APP_NAME: ${AIDA_APP_NAME:-id}
-      AIDA_ENVIRONMENT: ${AIDA_ENVIRONMENT:-}
     ports:
       - "127.0.0.1:3200:3200"
     restart: unless-stopped
