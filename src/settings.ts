@@ -3,12 +3,16 @@ import { AppConfig } from './config';
 /**
  * Settings live in NocoDB, not in the environment.
  *
- * The `oAuthConfig` table (base `id` by default) is a plain key/value store
- * that a Super System Admin can edit either through NocoDB itself at
- * nocodb.<parent-domain>, or through this app's /admin page. Every app under
- * the parent domain reads the same table with its own NocoDB API token, so
- * one set of credentials serves echo.X.TLD, aida.X.TLD, and whatever comes
- * next.
+ * The `oAuthConfig` table is a plain key/value store that a Super System Admin
+ * can edit either through NocoDB itself at nocodb.<parent-domain>, or through
+ * this app's /admin page. Every app under the parent domain reads the same
+ * table with its own NocoDB API token, so one set of credentials serves
+ * echo.X.TLD, aida.X.TLD, and whatever comes next.
+ *
+ * It lives in `AidaOffice`, the one base every Aida project shares. NocoDB link
+ * fields resolve only within a base, so sharing one is what lets these settings
+ * relate to the tables the other projects own. The base no longer says whose
+ * data it is — the table title does, and `oAuthConfig` is this project's.
  *
  * On boot the table is created and seeded with every known key (empty
  * values) if it does not exist yet, so the admin sees the full menu of
@@ -154,6 +158,18 @@ export class SettingsStore {
     );
     let base = bases.list.find((b) => b.title === this.config.NOCODB_BASE_NAME);
     if (!base) {
+      // Creating the base on demand is what makes a genuine first boot work, so
+      // it stays. But AidaOffice is shared now, and a mistyped NOCODB_BASE_NAME
+      // would otherwise create a second empty base and quietly start writing to
+      // it — a split-brain that looks like a working service until someone
+      // wonders where the settings went. Creation is therefore loud: on a real
+      // first boot this line is expected, and anywhere else it is the answer.
+      console.warn(
+        `[settings] NocoDB base "${this.config.NOCODB_BASE_NAME}" did not exist and was created. ` +
+          `Expected on a first boot. Otherwise NOCODB_BASE_NAME is probably wrong — the Aida ` +
+          `projects share one base, and settings written here will not be seen by the others. ` +
+          `Bases present: ${bases.list.map((b) => b.title).join(', ') || '(none)'}.`
+      );
       base = await this.api<{ id: string; title: string }>('POST', '/api/v2/meta/bases', {
         title: this.config.NOCODB_BASE_NAME,
       });

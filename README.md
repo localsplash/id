@@ -62,7 +62,7 @@ user entered straight from the portal.
 
 The `.env` carries **only** bootstrap plumbing: MySQL and NocoDB
 coordinates (see `.env.example`). Every application-level setting lives in
-the **`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`:
+the **`oAuthConfig` table** in NocoDB at `nocodb.X.TLD`:
 
 | Key | Purpose |
 | --- | --- |
@@ -75,9 +75,17 @@ the **`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`:
 | `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` / `MICROSOFT_TENANT` | Microsoft Entra ID OAuth |
 | `UISP_SSO_SECRET` / `UISP_PLUGIN_URL` / `UISP_BASE_URL` / `UISP_CRM_APP_KEY_READ` | UISP bridge & CRM |
 
-On first boot `id` creates the base/table and seeds every known key with an
+That table lives in **`AidaOffice`**, the one base every Aida project shares.
+NocoDB link fields resolve only within a base, so sharing one is what lets these
+settings relate to the tables the other projects own — AidaControl's tenant
+tables, AidaAdmin's `appConfig`. The base no longer says whose data it is; the
+table title does, and `oAuthConfig` is this project's.
+
+On first boot `id` creates the base and table and seeds every known key with an
 empty value and a description, so the menu of settings is visible without
-guessing. **A login method is only offered when all of its required keys are
+guessing. Creating the base logs a warning: on a first boot that is expected,
+but anywhere else it means `NOCODB_BASE_NAME` is wrong and this service is about
+to write settings into a base nothing else reads. **A login method is only offered when all of its required keys are
 set** — an unconfigured provider simply does not appear on the login page.
 
 Settings are re-read at most every 30 seconds; changes in NocoDB take
