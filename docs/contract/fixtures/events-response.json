@@ -1,0 +1,17 @@
+{
+  "$schema": "EventsResponse",
+  "items": [
+    {
+      "id": 1234,
+      "type": "session.revoked",
+      "occurredAt": "2026-08-26T06:00:00.000Z",
+      "data": { "iUserId": 7, "scope": "all" }
+    },
+    {
+      "id": 1235,
+      "type": "user.merged",
+      "occurredAt": "2026-08-26T06:05:00.000Z",
+      "data": { "fromUserId": 9, "toUserId": 7 }
+    }
+  ]
+}

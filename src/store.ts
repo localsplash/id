@@ -451,6 +451,131 @@ export async function listEventsSince(
   }));
 }
 
+// ─── Central user directory (CIDR-trusted server API) ────────────────────────
+
+export interface DirectoryUser {
+  iUserId: number;
+  email: string | null;
+  displayName: string | null;
+  /** True once any login method is attached — the pre-created UID was taken
+   *  over by a real sign-in (trusted-provider email match does this). */
+  claimed: boolean;
+}
+
+const dirUserSelect = `
+  SELECT u.iUserId, u.email, u.displayName,
+         EXISTS(SELECT 1 FROM id_tbl_Identity i WHERE i.iUserId = u.iUserId) AS claimed
+    FROM id_tbl_User u`;
+
+function toDirectoryUser(r: mysql.RowDataPacket): DirectoryUser {
+  return {
+    iUserId: r.iUserId as number,
+    email: (r.email as string) ?? null,
+    displayName: (r.displayName as string) ?? null,
+    claimed: Boolean(r.claimed),
+  };
+}
+
+export async function getDirectoryUser(
+  pool: mysql.Pool,
+  iUserId: number
+): Promise<DirectoryUser | null> {
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `${dirUserSelect} WHERE u.iUserId = ?`,
+    [iUserId]
+  );
+  return rows.length ? toDirectoryUser(rows[0]) : null;
+}
+
+/**
+ * Idempotent, concurrency-safe ensure-by-email.
+ *
+ * Two guards: the caller's idempotencyKey maps to the user its first call
+ * produced (a retried POST returns the same UID), and an advisory lock on
+ * the normalised email serialises concurrent ensures for the same person
+ * so exactly one row is created. Matching an existing user by email means
+ * repeat ensures — and ensures racing a login — converge on one UID.
+ */
+export async function ensureDirectoryUser(
+  pool: mysql.Pool,
+  params: { email: string; displayName: string | null; idempotencyKey: string | null }
+): Promise<DirectoryUser> {
+  const email = params.email.trim().toLowerCase();
+  const conn = await pool.getConnection();
+  try {
+    if (params.idempotencyKey) {
+      const [keyRows] = await conn.query<mysql.RowDataPacket[]>(
+        `${dirUserSelect} JOIN id_tbl_DirectoryKey k ON k.iUserId = u.iUserId
+          WHERE k.sIdempotencyKey = ?`,
+        [params.idempotencyKey]
+      );
+      if (keyRows.length) return toDirectoryUser(keyRows[0]);
+    }
+
+    // Advisory lock name is hashed: emails can exceed MySQL's 64-char
+    // lock-name limit, and the lock only needs to collide for equal emails.
+    const lockName = `id_dir_${crypto.createHash('sha256').update(email).digest('hex').slice(0, 40)}`;
+    const [lockRows] = await conn.query<mysql.RowDataPacket[]>(`SELECT GET_LOCK(?, 10) AS l`, [
+      lockName,
+    ]);
+    if (Number(lockRows[0]?.l) !== 1) throw new Error('Directory ensure lock timeout');
+    try {
+      const [existing] = await conn.query<mysql.RowDataPacket[]>(
+        `${dirUserSelect} WHERE u.email = ? ORDER BY u.iUserId ASC LIMIT 1`,
+        [email]
+      );
+      let user: DirectoryUser;
+      if (existing.length) {
+        user = toDirectoryUser(existing[0]);
+      } else {
+        const [ins] = await conn.query<mysql.ResultSetHeader>(
+          `INSERT INTO id_tbl_User (email, displayName) VALUES (?, ?)`,
+          [email, params.displayName]
+        );
+        user = { iUserId: ins.insertId, email, displayName: params.displayName, claimed: false };
+      }
+      if (params.idempotencyKey) {
+        await conn.query(
+          `INSERT IGNORE INTO id_tbl_DirectoryKey (sIdempotencyKey, iUserId) VALUES (?, ?)`,
+          [params.idempotencyKey, user.iUserId]
+        );
+      }
+      return user;
+    } finally {
+      await conn.query(`SELECT RELEASE_LOCK(?)`, [lockName]);
+    }
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * Keyset-paginated directory search. `cursor` is the last iUserId of the
+ * previous page (opaque to callers); results are minimal by design — no
+ * identities, sessions, codes, or credentials ever leave this endpoint.
+ */
+export async function searchDirectoryUsers(
+  pool: mysql.Pool,
+  params: { query: string; limit: number; cursor: number }
+): Promise<{ items: DirectoryUser[]; nextCursor: number | null }> {
+  const limit = Math.min(Math.max(1, Math.floor(params.limit) || 25), 100);
+  const clauses: string[] = ['u.iUserId > ?'];
+  const args: unknown[] = [params.cursor];
+  if (params.query) {
+    // Escape LIKE metacharacters so a query is always a literal substring.
+    const like = `%${params.query.replace(/[\\%_]/g, '\\$&')}%`;
+    clauses.push('(u.email LIKE ? OR u.displayName LIKE ?)');
+    args.push(like, like);
+  }
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `${dirUserSelect} WHERE ${clauses.join(' AND ')} ORDER BY u.iUserId ASC LIMIT ?`,
+    [...args, limit + 1]
+  );
+  const items = rows.slice(0, limit).map(toDirectoryUser);
+  const nextCursor = rows.length > limit ? items[items.length - 1].iUserId : null;
+  return { items, nextCursor };
+}
+
 // ─── Identity remapping ───────────────────────────────────────────────────────
 
 export interface MergeResult {

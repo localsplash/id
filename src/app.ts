@@ -42,6 +42,7 @@ import {
   isValidDomainList,
 } from './web';
 import * as store from './store';
+import { parseCidrList, resolveClientIp, ipInCidrs } from './net';
 import { emitEvent, FAILING_THRESHOLD, EVENT_TYPES } from './webhooks';
 
 const publicDir = path.join(__dirname, '..', 'public');
@@ -84,6 +85,78 @@ export function buildApp() {
     const id = getCookie(req, SESSION_COOKIE);
     if (!id) return null;
     return store.getSession(db, id);
+  }
+
+  // ── Server-to-server trust (POC: IPv4/CIDR network policy) ────────────────
+  //
+  // The server-only endpoints (/api/token, /api/apps/register, /api/events,
+  // /api/directory/*) are protected by an explicit IPv4 allowlist. This
+  // authenticates a trusted server/network, not an individual application —
+  // apps sharing an allowed egress IP can call the same endpoints, which is
+  // accepted for the first-party POC on a controlled host. ID_APP_AUTH_MODE
+  // keeps the legacy ID_CLIENT_SECRET check available during rollout.
+  const appCidrs = parseCidrList(config.ID_TRUSTED_APP_CIDRS);
+  const proxyCidrs = parseCidrList(config.ID_TRUSTED_PROXY_CIDRS);
+
+  /** True when the request's resolved IPv4 peer is inside the app allowlist. */
+  function peerIsTrusted(req: express.Request): boolean {
+    if (!appCidrs.length) return false;
+    const peer = resolveClientIp(req, proxyCidrs);
+    return peer !== null && ipInCidrs(peer.ipNum, appCidrs);
+  }
+
+  /** Generic 403; the specifics go to the log, keyed by a correlation id. */
+  function denyUntrusted(req: express.Request, res: express.Response): void {
+    const correlationId = store.generateId(8);
+    const peer = resolveClientIp(req, proxyCidrs);
+    logger.warn(
+      { correlationId, peerIp: peer?.ip ?? null, forwarded: peer?.forwarded ?? false, path: req.path },
+      '[trust] rejected server-endpoint call'
+    );
+    res.status(403).json({ error: 'Forbidden', correlationId });
+  }
+
+  function presentedSecret(req: express.Request): string {
+    return String(
+      (req.body as Record<string, string> | undefined)?.client_secret ??
+        req.get('X-Id-Client-Secret') ??
+        ''
+    );
+  }
+
+  /**
+   * Admission for the application-integration endpoints, honouring the
+   * rollout flag: 'cidr' (POC default) trusts the network allowlist alone,
+   * 'secret' is the legacy shared-secret check alone, 'dual' accepts either.
+   */
+  async function requireTrustedApp(
+    req: express.Request,
+    res: express.Response
+  ): Promise<Settings | null> {
+    const settings = await getSettings();
+    const mode = config.ID_APP_AUTH_MODE;
+    if (mode !== 'secret' && peerIsTrusted(req)) return settings;
+    if (mode !== 'cidr') {
+      if (mode === 'secret' && !settings.ID_CLIENT_SECRET) {
+        res.status(503).json({ error: 'ID_CLIENT_SECRET is not configured' });
+        return null;
+      }
+      if (settings.ID_CLIENT_SECRET && secretsMatch(presentedSecret(req), settings.ID_CLIENT_SECRET)) {
+        return settings;
+      }
+    }
+    denyUntrusted(req, res);
+    return null;
+  }
+
+  /**
+   * Admission for the directory API: always and only the CIDR allowlist —
+   * no client-secret header or body field is accepted, in any mode.
+   */
+  function requireTrustedPeer(req: express.Request, res: express.Response): boolean {
+    if (peerIsTrusted(req)) return true;
+    denyUntrusted(req, res);
+    return false;
   }
 
   // ── Login completion (shared by every provider and the UISP bridge) ────────
@@ -745,24 +818,25 @@ export function buildApp() {
   // ── Token exchange (application → id, server to server) ────────────────────
 
   /**
-   * POST /api/token  { code, redirect_uri, client_secret }
+   * POST /api/token  { code, redirect_uri }
    *
    * The application proves the code was addressed to it (redirect_uri must
-   * match what the code was minted for) and that it is one of ours
-   * (ID_CLIENT_SECRET from oAuthConfig — the same secret all apps under the
-   * domain read from NocoDB). Codes are single-use and expire in 5 minutes.
+   * match what the code was minted for) and that it is one of ours: in the
+   * POC its server's IPv4 peer is inside ID_TRUSTED_APP_CIDRS (the legacy
+   * ID_CLIENT_SECRET check remains available via ID_APP_AUTH_MODE during
+   * rollout). Codes are single-use and expire in 5 minutes.
+   *
+   * user.superAdmin in the response is the consumed code's bSuperAdmin —
+   * copied from the SSO session at /authorize (or computed once at fresh
+   * login and written to both Session and AuthCode). Redemption NEVER
+   * recalculates privilege from the email.
    */
   app.post('/api/token', async (req, res, next) => {
     try {
-      const settings = await getSettings();
-      const { code, redirect_uri, client_secret } = (req.body ?? {}) as Record<string, string>;
+      const settings = await requireTrustedApp(req, res);
+      if (!settings) return;
+      const { code, redirect_uri } = (req.body ?? {}) as Record<string, string>;
 
-      if (!settings.ID_CLIENT_SECRET) {
-        return res.status(503).json({ error: 'ID_CLIENT_SECRET is not configured' });
-      }
-      if (!secretsMatch(client_secret, settings.ID_CLIENT_SECRET)) {
-        return res.status(401).json({ error: 'Invalid client secret' });
-      }
       if (!code || !redirect_uri) {
         return res.status(400).json({ error: 'code and redirect_uri are required' });
       }
@@ -805,34 +879,7 @@ export function buildApp() {
   // ── Application integration (the webhook standard) ─────────────────────────
 
   /**
-   * Applications authenticate to these with the same ID_CLIENT_SECRET they
-   * use for the token exchange — it is the shared "you are one of ours"
-   * credential, and every app under the domain already reads it from
-   * oAuthConfig.
-   */
-  async function requireAppSecret(
-    req: express.Request,
-    res: express.Response
-  ): Promise<Settings | null> {
-    const settings = await getSettings();
-    if (!settings.ID_CLIENT_SECRET) {
-      res.status(503).json({ error: 'ID_CLIENT_SECRET is not configured' });
-      return null;
-    }
-    const presented = String(
-      (req.body as Record<string, string> | undefined)?.client_secret ??
-        req.get('X-Id-Client-Secret') ??
-        ''
-    );
-    if (!secretsMatch(presented, settings.ID_CLIENT_SECRET)) {
-      res.status(401).json({ error: 'Invalid client secret' });
-      return null;
-    }
-    return settings;
-  }
-
-  /**
-   * POST /api/apps/register { client_secret, name, webhook_url }
+   * POST /api/apps/register { name, webhook_url }
    *
    * Called by every app on boot. Returns the secret that signs deliveries to
    * it, so the app holds one less configured value: its integration is
@@ -840,7 +887,7 @@ export function buildApp() {
    */
   app.post('/api/apps/register', async (req, res, next) => {
     try {
-      const settings = await requireAppSecret(req, res);
+      const settings = await requireTrustedApp(req, res);
       if (!settings) return;
 
       const body = (req.body ?? {}) as Record<string, string>;
@@ -865,6 +912,11 @@ export function buildApp() {
       // first real revocation to discover it is not.
       await emitEvent(db, 'ping', { origin }, { onlyOrigin: origin });
 
+      // POC contract: deliveries are trusted by network policy (the app's
+      // /id/events endpoint allowlists id's egress IPv4s; TLS protects the
+      // transport) and deduplicated by event id. The HMAC secret/signature
+      // remain for legacy (secret-mode) receivers but are OPTIONAL — no
+      // receiver is required to verify them.
       return res.json({
         ok: true,
         origin,
@@ -874,6 +926,7 @@ export function buildApp() {
           header: 'X-Id-Signature',
           scheme: 'sha256=HMAC_SHA256(secret, `${X-Id-Timestamp}.${rawBody}`)',
           toleranceSeconds: 300,
+          required: false,
         },
       });
     } catch (err) {
@@ -891,13 +944,82 @@ export function buildApp() {
    */
   app.get('/api/events', async (req, res, next) => {
     try {
-      if (!(await requireAppSecret(req, res))) return;
+      if (!(await requireTrustedApp(req, res))) return;
       const since = Number(req.query.since ?? 0);
       if (!Number.isFinite(since) || since < 0) {
         return res.status(400).json({ error: 'since must be a non-negative event id' });
       }
       const items = await store.listEventsSince(db, since);
       return res.json({ items });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ── Central user directory (CIDR-trusted, server-only) ────────────────────
+  //
+  // Lets a trusted application (AidaAdmin) create, locate, and select
+  // central users by iUserId without direct MySQL access or duplicate
+  // person records. Responses are deliberately minimal: iUserId, email,
+  // displayName, claimed — never identities, sessions, codes, or OAuth
+  // credentials. Access is by IPv4 allowlist only; browser requests and
+  // client secrets are invalid here in every mode.
+
+  /**
+   * POST /api/directory/users { email, displayName?, idempotencyKey? }
+   *
+   * Idempotent ensure: repeat calls (same email or same idempotencyKey)
+   * return the same iUserId. A user pre-created here is `claimed: false`
+   * until a trusted-provider login with a matching verified email attaches
+   * an identity — the same email-match path every login uses. Untrusted
+   * providers can never claim a UID by asserted email.
+   */
+  app.post('/api/directory/users', async (req, res, next) => {
+    try {
+      if (!requireTrustedPeer(req, res)) return;
+      const body = (req.body ?? {}) as Record<string, string>;
+      const email = String(body.email ?? '').trim().toLowerCase();
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255) {
+        return res.status(400).json({ error: 'A valid email is required' });
+      }
+      const displayName = String(body.displayName ?? '').trim().slice(0, 255) || null;
+      const idempotencyKey = String(body.idempotencyKey ?? '').trim().slice(0, 128) || null;
+      const user = await store.ensureDirectoryUser(db, { email, displayName, idempotencyKey });
+      return res.json(user);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/directory/users/:iUserId', async (req, res, next) => {
+    try {
+      if (!requireTrustedPeer(req, res)) return;
+      const iUserId = Number(req.params.iUserId);
+      if (!Number.isInteger(iUserId) || iUserId <= 0) {
+        return res.status(400).json({ error: 'Invalid iUserId' });
+      }
+      const user = await store.getDirectoryUser(db, iUserId);
+      if (!user) return res.status(404).json({ error: 'Not found' });
+      return res.json(user);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/directory/users', async (req, res, next) => {
+    try {
+      if (!requireTrustedPeer(req, res)) return;
+      const query = String(req.query.query ?? '').trim().slice(0, 255);
+      const limit = Number(req.query.limit ?? 25);
+      const cursor = Number(req.query.cursor ?? 0);
+      if (!Number.isFinite(limit) || limit < 1 || limit > 100) {
+        return res.status(400).json({ error: 'limit must be between 1 and 100' });
+      }
+      if (!Number.isFinite(cursor) || cursor < 0) {
+        return res.status(400).json({ error: 'cursor must be a non-negative user id' });
+      }
+      const page = await store.searchDirectoryUsers(db, { query, limit, cursor });
+      return res.json(page);
     } catch (err) {
       next(err);
     }

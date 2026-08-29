@@ -1,0 +1,13 @@
+{
+  "$schema": "RegistrationResponse",
+  "ok": true,
+  "origin": "https://app.x.tld",
+  "secret": "0f3b0c9a4d6e8f1023456789abcdef000f3b0c9a4d6e8f1023456789abcdef00",
+  "events": ["ping", "session.revoked", "user.merged", "identity.linked", "identity.unlinked"],
+  "signature": {
+    "header": "X-Id-Signature",
+    "scheme": "sha256=HMAC_SHA256(secret, `${X-Id-Timestamp}.${rawBody}`)",
+    "toleranceSeconds": 300,
+    "required": false
+  }
+}

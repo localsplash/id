@@ -1,0 +1,463 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "id — X.TLD application integration contract",
+    "version": "1.0.0",
+    "description": "The application-handoff protocol of the `id` identity service for first-party applications under the configured PARENT_DOMAIN (written `X.TLD` throughout; `localsplash.ai` URLs anywhere are deployment examples only, never normative).\n\nThis is id's own protocol, NOT standard OIDC. There is no application secret and no webhook HMAC in the POC contract: browser authorization is public, and every server-only endpoint is trusted by TLS plus an explicit IPv4/CIDR network policy.\n\n## Network trust (server-only endpoints)\n\n`POST /api/token`, `POST /api/apps/register`, `GET /api/events`, and all `/api/directory/*` endpoints accept a request only when the caller's resolved IPv4 peer is inside the `ID_TRUSTED_APP_CIDRS` allowlist (comma-separated IPv4 CIDRs; `/32` and bare addresses supported). The TCP socket peer is authoritative; `X-Forwarded-For` is honoured only when the direct peer is inside `ID_TRUSTED_PROXY_CIDRS`, and then only across trusted hops evaluated right-to-left. Malformed, IPv6, IPv4-mapped-IPv6, and non-allowlisted addresses are rejected deterministically with a generic 403. This authenticates a trusted server/network, not an individual application: applications sharing an allowed egress IP can call the same endpoints — accepted for the first-party POC on a controlled host, and NOT suitable for unrelated or customer-hosted X.TLD applications.\n\n## Flow\n\n1. `GET /authorize?redirect_uri&state` (public, browser). `redirect_uri` must be HTTPS on X.TLD or a subdomain.\n2. id redirects back with a one-time `code` (and the echoed `state`).\n3. The application's CIDR-trusted server redeems it at `POST /api/token` with the exact `redirect_uri`.\n4. The same server registers at `POST /api/apps/register` and catches up from `GET /api/events?since`.\n\n## superAdmin provenance (pinned)\n\n`user.superAdmin` in the token response is session-scoped and never stored on `id_tbl_User`. For an existing SSO session, `/authorize` copies `id_tbl_Session.bSuperAdmin` into `id_tbl_AuthCode`; redemption returns the consumed code's `bSuperAdmin`. For a fresh provider login, id calculates the value once and writes the same value to both Session and AuthCode. Redemption NEVER recalculates privilege from the email.\n\n## Event delivery (outbound id → application)\n\nid POSTs events to the registered `webhook_url`. The receiving application's endpoint allowlists id's egress IPv4/CIDRs; TLS protects the transport. Deliveries carry `X-Id-Event`, `X-Id-Event-Id`, and `X-Id-Timestamp` headers; event ids and timestamps are what idempotency/replay handling keys on (the same event id can arrive more than once). An `X-Id-Signature` HMAC header MAY be present for legacy receivers and is OPTIONAL to verify — it is not part of the POC contract."
+  },
+  "servers": [
+    {
+      "url": "https://id.X.TLD",
+      "description": "X.TLD is the configured PARENT_DOMAIN (placeholder, normative)."
+    }
+  ],
+  "paths": {
+    "/authorize": {
+      "get": {
+        "operationId": "authorize",
+        "summary": "Begin an application login (public, browser)",
+        "description": "With a live SSO session, immediately 302s to `redirect_uri` with a one-time `code` (and echoed `state`). Otherwise shows the login page and completes the redirect after authentication. Codes are single-use, expire in 5 minutes, and are bound to the exact `redirect_uri` they were minted for.",
+        "parameters": [
+          {
+            "name": "redirect_uri",
+            "in": "query",
+            "required": true,
+            "description": "HTTPS URL whose host is X.TLD or any subdomain of it. Nothing else is accepted.",
+            "schema": { "type": "string", "format": "uri" }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "description": "Opaque value echoed back verbatim on the redirect.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to `redirect_uri` with `?code=<one-time>&state=<echoed>`."
+          },
+          "200": { "description": "Login page (no SSO session yet)." },
+          "400": { "description": "Invalid redirect_uri." }
+        }
+      }
+    },
+    "/api/token": {
+      "post": {
+        "operationId": "redeemCode",
+        "summary": "Redeem a one-time handoff code (CIDR-trusted server only)",
+        "description": "The `redirect_uri` must exactly match the one the code was minted for (exact redirect binding). Codes are single-use and expire 5 minutes after minting; a replayed, expired, or re-bound code yields 400. No client secret is required by the POC contract — admission is the IPv4/CIDR policy. `user.superAdmin` is the consumed code's `bSuperAdmin` (see superAdmin provenance); it is never recalculated from the email at redemption.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TokenRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The signed-in identity.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing fields, or an invalid, expired, reused, or re-bound code.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "403": {
+            "description": "Caller's resolved IPv4 peer is not allowlisted.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/apps/register": {
+      "post": {
+        "operationId": "registerApp",
+        "summary": "Register the application's event endpoint (CIDR-trusted server only)",
+        "description": "Called by every app on boot; idempotent per origin. `webhook_url` must be HTTPS on X.TLD or a subdomain. id immediately queues a `ping` delivery to prove the endpoint is reachable.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RegistrationRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Registration accepted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RegistrationResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid webhook_url.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "403": {
+            "description": "Caller's resolved IPv4 peer is not allowlisted.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/events": {
+      "get": {
+        "operationId": "listEvents",
+        "summary": "Boot-time event catch-up (CIDR-trusted server only)",
+        "description": "Events after `since`, oldest first. Combined with idempotent handling of pushed deliveries (dedupe on event id), this closes any gap from downtime without polling.",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "Last event id already processed; defaults to 0.",
+            "schema": { "type": "integer", "minimum": 0, "default": 0 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ordered events.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EventsResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid `since`.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "403": {
+            "description": "Caller's resolved IPv4 peer is not allowlisted.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/directory/users": {
+      "post": {
+        "operationId": "ensureDirectoryUser",
+        "summary": "Idempotently ensure a central user by email (CIDR-trusted server only)",
+        "description": "Creates the user if no user holds the normalised email, otherwise returns the existing one; concurrency-safe, and a repeated `idempotencyKey` returns the UID the first call produced. A pre-created user is `claimed: false` until a trusted-provider login with a matching verified email attaches an identity — untrusted providers can never claim a UID by asserted email. No client-secret header or body field is accepted on any directory endpoint, in any deployment mode.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/DirectoryEnsureRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The ensured user (minimal fields only — never identities, sessions, codes, or OAuth credentials).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DirectoryUser" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid email.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "403": {
+            "description": "Caller's resolved IPv4 peer is not allowlisted.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "searchDirectoryUsers",
+        "summary": "Search central users (CIDR-trusted server only)",
+        "parameters": [
+          {
+            "name": "query",
+            "in": "query",
+            "required": false,
+            "description": "Literal substring matched against email and displayName.",
+            "schema": { "type": "string", "maxLength": 255 }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25 }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Keyset cursor: the `nextCursor` of the previous page; 0 for the first page.",
+            "schema": { "type": "integer", "minimum": 0, "default": 0 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of users.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DirectoryPage" }
+              }
+            }
+          },
+          "400": {
+            "description": "limit or cursor out of bounds.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "403": {
+            "description": "Caller's resolved IPv4 peer is not allowlisted.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/directory/users/{iUserId}": {
+      "get": {
+        "operationId": "getDirectoryUser",
+        "summary": "Fetch one central user by iUserId (CIDR-trusted server only)",
+        "parameters": [
+          {
+            "name": "iUserId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "minimum": 1 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DirectoryUser" }
+              }
+            }
+          },
+          "404": {
+            "description": "No such user.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "403": {
+            "description": "Caller's resolved IPv4 peer is not allowlisted.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "TokenRequest": {
+        "type": "object",
+        "required": ["code", "redirect_uri"],
+        "additionalProperties": true,
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "The one-time handoff code from the /authorize redirect."
+          },
+          "redirect_uri": {
+            "type": "string",
+            "format": "uri",
+            "description": "Must exactly match the redirect_uri the code was minted for."
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "required": ["user", "identity", "identities"],
+        "properties": {
+          "user": {
+            "type": "object",
+            "required": ["iUserId", "email", "displayName", "superAdmin"],
+            "properties": {
+              "iUserId": {
+                "type": "integer",
+                "description": "The platform-wide person id (id_db.id_tbl_User.iUserId)."
+              },
+              "email": { "type": ["string", "null"] },
+              "displayName": { "type": ["string", "null"] },
+              "superAdmin": {
+                "type": "boolean",
+                "description": "Session-scoped. Provenance: existing SSO Session → AuthCode → redemption; a fresh login writes the same calculated value to both Session and AuthCode. Redemption never recalculates from email."
+              }
+            }
+          },
+          "identity": {
+            "type": "object",
+            "required": ["provider", "subject"],
+            "properties": {
+              "provider": { "type": ["string", "null"] },
+              "subject": { "type": ["string", "null"] }
+            },
+            "description": "The login method this particular sign-in used."
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["provider", "subject", "email"],
+              "properties": {
+                "provider": { "type": "string" },
+                "subject": { "type": "string" },
+                "email": { "type": ["string", "null"] }
+              }
+            }
+          }
+        }
+      },
+      "RegistrationRequest": {
+        "type": "object",
+        "required": ["webhook_url"],
+        "additionalProperties": true,
+        "properties": {
+          "name": { "type": "string", "maxLength": 128 },
+          "webhook_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "HTTPS URL on X.TLD or a subdomain where the app receives events."
+          }
+        }
+      },
+      "RegistrationResponse": {
+        "type": "object",
+        "required": ["ok", "origin", "events"],
+        "properties": {
+          "ok": { "const": true },
+          "origin": { "type": "string" },
+          "secret": {
+            "type": "string",
+            "description": "Legacy webhook-HMAC secret. OPTIONAL to use: POC receivers trust network policy (allowlist id's egress IPv4/CIDRs) plus TLS and are not required to verify signatures."
+          },
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EventType" }
+          },
+          "signature": {
+            "type": "object",
+            "description": "Describes the legacy, optional signature scheme.",
+            "properties": {
+              "header": { "type": "string" },
+              "scheme": { "type": "string" },
+              "toleranceSeconds": { "type": "integer" },
+              "required": { "const": false }
+            }
+          }
+        }
+      },
+      "EventType": {
+        "type": "string",
+        "enum": ["ping", "session.revoked", "user.merged", "identity.linked", "identity.unlinked"]
+      },
+      "Event": {
+        "type": "object",
+        "required": ["id", "type", "occurredAt", "data"],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Strictly increasing; the idempotency/replay key. The same id can be delivered more than once — handlers must dedupe on it."
+          },
+          "type": { "$ref": "#/components/schemas/EventType" },
+          "occurredAt": { "type": "string", "format": "date-time" },
+          "data": { "type": "object" }
+        }
+      },
+      "EventsResponse": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Event" },
+            "description": "Oldest first, ordered by id."
+          }
+        }
+      },
+      "DirectoryEnsureRequest": {
+        "type": "object",
+        "required": ["email"],
+        "additionalProperties": true,
+        "properties": {
+          "email": { "type": "string", "format": "email", "maxLength": 255 },
+          "displayName": { "type": "string", "maxLength": 255 },
+          "idempotencyKey": { "type": "string", "maxLength": 128 }
+        }
+      },
+      "DirectoryUser": {
+        "type": "object",
+        "required": ["iUserId", "email", "displayName", "claimed"],
+        "additionalProperties": false,
+        "properties": {
+          "iUserId": { "type": "integer" },
+          "email": { "type": ["string", "null"] },
+          "displayName": { "type": ["string", "null"] },
+          "claimed": {
+            "type": "boolean",
+            "description": "True once any login method is attached — a trusted-provider login with a matching verified email claims a pre-created UID; untrusted providers never can."
+          }
+        },
+        "description": "Deliberately minimal: never identities, sessions, codes, or OAuth credentials."
+      },
+      "DirectoryPage": {
+        "type": "object",
+        "required": ["items", "nextCursor"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DirectoryUser" }
+          },
+          "nextCursor": {
+            "type": ["integer", "null"],
+            "description": "Pass as `cursor` for the next page; null when this is the last page."
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Generic; 403 bodies never disclose the policy or the resolved peer."
+          },
+          "correlationId": {
+            "type": "string",
+            "description": "Present on 403s; matches the server log line carrying the resolved peer IP."
+          }
+        }
+      }
+    }
+  }
+}

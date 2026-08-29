@@ -1,0 +1,7 @@
+{
+  "$schema": "DirectoryUser",
+  "iUserId": 12,
+  "email": "new.hire@x.tld",
+  "displayName": "New Hire",
+  "claimed": false
+}

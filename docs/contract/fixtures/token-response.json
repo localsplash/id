@@ -1,0 +1,14 @@
+{
+  "$schema": "TokenResponse",
+  "user": {
+    "iUserId": 7,
+    "email": "ada@x.tld",
+    "displayName": "Ada Lovelace",
+    "superAdmin": true
+  },
+  "identity": { "provider": "google", "subject": "108234958234502" },
+  "identities": [
+    { "provider": "google", "subject": "108234958234502", "email": "ada@x.tld" },
+    { "provider": "uisp", "subject": "42", "email": null }
+  ]
+}
