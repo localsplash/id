@@ -22,15 +22,17 @@ import mysql from 'mysql2/promise';
  *   { "id": 1234, "type": "session.revoked",
  *     "occurredAt": "2026-08-26T06:00:00.000Z", "data": { … } }
  *
- * The signature is an HMAC-SHA256 over `${timestamp}.${rawBody}` keyed with
- * the app's webhook secret. Receivers MUST verify it against the raw body
- * (not a re-serialised object), MUST reject a timestamp outside ±300s, and
- * MUST compare in constant time. Signing the timestamp alongside the body
- * is what makes a captured delivery useless as a replay.
+ * POC trust model: the receiver's /id/events endpoint allowlists id's
+ * egress IPv4/CIDRs and TLS protects the transport, so the HMAC signature
+ * is OPTIONAL — sent when the app holds a webhook secret (legacy
+ * secret-mode receivers), omitted otherwise. Receivers that do verify it
+ * must check against the raw body (not a re-serialised object), reject a
+ * timestamp outside ±300s, and compare in constant time.
  *
  * A receiver answers 2xx once the event is durably handled. Any other
  * status — or a timeout — is a failure and will be retried, so handlers
- * must be idempotent: the same event id can arrive more than once.
+ * must be idempotent: the same event id can arrive more than once. Event
+ * ids and timestamps are what replay/idempotency handling keys on.
  */
 
 export const EVENT_TYPES = [
@@ -160,7 +162,7 @@ interface DueDelivery {
   jsonData: string | Record<string, unknown>;
   dtCreated: string;
   sWebhookUrl: string;
-  sSecret: string;
+  sSecret: string | null;
 }
 
 async function markSuccess(pool: mysql.Pool, d: DueDelivery): Promise<void> {
@@ -218,18 +220,25 @@ async function deliverOne(pool: mysql.Pool, d: DueDelivery): Promise<boolean> {
   const rawBody = JSON.stringify(event);
   const timestamp = Math.floor(Date.now() / 1000);
 
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Id-Event': d.sType,
+    'X-Id-Event-Id': String(d.iEventId),
+    'X-Id-Timestamp': String(timestamp),
+  };
+  // Signature is legacy/optional in the POC: sent only when the app holds a
+  // webhook secret; network trust (IP allowlist at the receiver) + TLS is
+  // the POC integrity story.
+  if (d.sSecret) {
+    headers['X-Id-Signature'] = `sha256=${signPayload(d.sSecret, timestamp, rawBody)}`;
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
   try {
     const resp = await fetch(d.sWebhookUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Id-Event': d.sType,
-        'X-Id-Event-Id': String(d.iEventId),
-        'X-Id-Timestamp': String(timestamp),
-        'X-Id-Signature': `sha256=${signPayload(d.sSecret, timestamp, rawBody)}`,
-      },
+      headers,
       body: rawBody,
       signal: controller.signal,
     });
@@ -262,7 +271,7 @@ export async function drainDeliveries(pool: mysql.Pool, limit = 50): Promise<num
        JOIN id_tbl_App   a ON a.sOrigin  = d.sOrigin
       WHERE d.dtDelivered IS NULL AND d.dtAbandoned IS NULL
         AND d.dtNextAttempt IS NOT NULL AND d.dtNextAttempt <= NOW(3)
-        AND a.sWebhookUrl IS NOT NULL AND a.sSecret IS NOT NULL
+        AND a.sWebhookUrl IS NOT NULL
       ORDER BY d.iEventId ASC
       LIMIT ?`,
     [limit]

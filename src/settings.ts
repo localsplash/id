@@ -41,8 +41,10 @@ export const KNOWN_SETTINGS: SettingDef[] = [
   {
     key: 'ID_CLIENT_SECRET',
     description:
-      'Shared secret that applications present when exchanging a handoff code at ' +
-      'POST /api/token. Generate with: openssl rand -hex 32',
+      'LEGACY (rollout only). Shared secret applications present at POST /api/token ' +
+      'when ID_APP_AUTH_MODE is secret or dual. The POC default (cidr) trusts the ' +
+      'ID_TRUSTED_APP_CIDRS IPv4 allowlist instead and ignores this. ' +
+      'Generate with: openssl rand -hex 32',
   },
   {
     key: 'SUPERADMIN_DOMAIN',

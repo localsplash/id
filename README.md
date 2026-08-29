@@ -35,7 +35,7 @@ The app then redeems the code server-to-server:
 
 ```
 POST https://id.X.TLD/api/token
-{ "code": "…", "redirect_uri": "https://app.X.TLD/auth/callback", "client_secret": "<ID_CLIENT_SECRET>" }
+{ "code": "…", "redirect_uri": "https://app.X.TLD/auth/callback" }
 
 → { "user": { "iUserId", "email", "displayName", "superAdmin" },
     "identity": { "provider", "subject" },
@@ -43,8 +43,119 @@ POST https://id.X.TLD/api/token
 ```
 
 Codes are single-use, expire in 5 minutes, and are bound to the exact
-`redirect_uri` they were minted for. `ID_CLIENT_SECRET` comes from the same
-NocoDB settings table every app reads.
+`redirect_uri` they were minted for. No application secret is required:
+the calling server is admitted by **network trust** (below). The legacy
+`ID_CLIENT_SECRET` check still exists behind `ID_APP_AUTH_MODE` for the
+rollout window.
+
+`user.superAdmin` is **session-scoped and never stored on the user row**.
+Its provenance is pinned by the contract: an existing SSO session's
+`bSuperAdmin` is copied into the auth code at `/authorize`, and redemption
+returns the consumed code's value; a fresh login computes it once and
+writes the same value to both Session and AuthCode. Redemption never
+recalculates privilege from the email.
+
+## Network trust (POC: IPv4/CIDR policy)
+
+The server-only endpoints — `POST /api/token`, `POST /api/apps/register`,
+`GET /api/events`, and everything under `/api/directory/` — accept a
+request only when the caller's resolved IPv4 peer is inside
+`ID_TRUSTED_APP_CIDRS` (comma-separated IPv4 CIDRs; `/32` and bare
+addresses accepted). Browser authorization stays public.
+
+Resolution rules, applied deterministically:
+
+- The **TCP socket peer** is authoritative. Real IPv6 peers are rejected
+  (a kernel-reported `::ffff:a.b.c.d` dual-stack peer is normalised to
+  IPv4).
+- `X-Forwarded-For` is honoured **only** when the socket peer is inside
+  `ID_TRUSTED_PROXY_CIDRS`, and only across trusted hops evaluated
+  right-to-left; the first non-proxy hop is the client. Malformed, IPv6,
+  or IPv4-mapped entries in the header are rejected outright — a spoofed
+  header from an untrusted peer changes nothing.
+- Denials are a generic `403 { "error": "Forbidden", "correlationId" }`;
+  the log line carrying that correlation id records the resolved peer IP.
+- In production, startup **fails** when `ID_APP_AUTH_MODE` needs CIDRs and
+  `ID_TRUSTED_APP_CIDRS` is empty, and when any CIDR entry is malformed.
+
+`ID_APP_AUTH_MODE` is the rollout flag: `cidr` (POC default), `secret`
+(legacy `ID_CLIENT_SECRET` only), or `dual` (either accepted) for the
+migration window. The directory endpoints are CIDR-only in **every** mode —
+no client-secret header or body field is ever accepted there.
+
+> **Boundary — read this before reusing the pattern.** CIDR trust
+> authenticates a *server/network*, not an individual application. Every
+> application egressing from an allowed IP can call the same endpoints.
+> That is accepted for the first-party POC on the controlled
+> LSAidaOffice01 host, and is **not** suitable for unrelated or
+> customer-hosted X.TLD applications.
+
+Enforce the same policy at the edge as well as in the app. NGINX, with
+apps at `203.0.113.7` and an internal `10.9.0.0/16`:
+
+```nginx
+# Server-only API: allowlist app servers, deny the world.
+location ~ ^/api/(token|apps/register|events|directory) {
+    allow 203.0.113.7/32;
+    allow 10.9.0.0/16;
+    deny  all;
+    proxy_pass http://id-web:3200;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+# Everything else (authorize, login, account, admin) stays public.
+location / {
+    proxy_pass http://id-web:3200;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+When NGINX fronts the app like this, put the NGINX host's IP in
+`ID_TRUSTED_PROXY_CIDRS` so the app evaluates the forwarded client
+address; the application-layer check then re-applies the same allowlist.
+Firewall prerequisite: only the reverse proxy (and, on the controlled
+host, the app servers) may reach the app port at all — the allowlist is
+defence in depth, not the only wall.
+
+For **outbound** event delivery, the receiving application's `/id/events`
+endpoint applies the mirror-image policy: allowlist id's egress IPv4/CIDRs
+at its ingress. TLS protects the transport; event ids and timestamps drive
+idempotency and replay handling. The per-app webhook HMAC is no longer part
+of the POC contract — the signature header is still sent when the app holds
+a legacy secret, but verifying it is optional.
+
+## The machine-readable contract
+
+The versioned integration contract lives at
+[`docs/openapi.json`](docs/openapi.json) (OpenAPI 3.1), with response
+fixtures under [`docs/contract/fixtures/`](docs/contract/fixtures/) and a
+typed TypeScript client in [`src/contractClient.ts`](src/contractClient.ts)
+that compiles with the build. `npm test` validates the fixtures against the
+contract and pins the POC invariants (superAdmin provenance, exact redirect
+binding, single-use five-minute codes, no secret fields); CI additionally
+rejects breaking contract changes on pull requests (`oasdiff`). `X.TLD` in
+the contract is the configured `PARENT_DOMAIN` placeholder — `localsplash.ai`
+URLs anywhere are deployment examples, never normative.
+
+## Central user directory (CIDR-trusted, server-only)
+
+Lets a trusted application (AidaAdmin) create, locate, and select central
+users by `iUserId` without direct MySQL access or duplicate person records:
+
+```
+POST /api/directory/users            { email, displayName?, idempotencyKey? }
+GET  /api/directory/users/{iUserId}
+GET  /api/directory/users?query=&limit=25&cursor=
+→ { iUserId, email, displayName, claimed }
+```
+
+The ensure is idempotent and concurrency-safe: repeat calls (same email,
+or same `idempotencyKey`) return the same `iUserId`. A pre-created user is
+`claimed: false` until a **trusted-provider** login with a matching
+verified email attaches an identity — the same email-match path every
+login uses — after which the person signs in holding the UID that was
+handed out here. Untrusted providers can never claim a UID by asserted
+email. Responses are deliberately minimal: never identities, sessions,
+codes, or OAuth credentials.
 
 **Sessions persist forever — until revoked.** There is no expiry. A login
 ends only when the user signs out, signs out everywhere, or a Super System
@@ -68,7 +179,7 @@ the **`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`:
 | --- | --- |
 | `PARENT_DOMAIN` | Apex domain (`X.TLD`) the **apps** are served from; drives the cookie scope and redirect allowlist, and is the default super-admin domain |
 | `APP_BASE_URL` | Public base URL of this app, e.g. `https://id.X.TLD` |
-| `ID_CLIENT_SECRET` | Shared secret apps present at `/api/token` |
+| `ID_CLIENT_SECRET` | **Legacy (rollout only)** — shared secret apps present at `/api/token` when `ID_APP_AUTH_MODE` is `secret`/`dual`; ignored in the default `cidr` mode |
 | `SUPERADMIN_DOMAIN` | Domain(s) the **identity provider vouches for** whose users are Super System Admins — comma-separated list accepted (default: `PARENT_DOMAIN`) |
 | `DEFAULT_REDIRECT_URI` | Where an unsolicited sign-in (e.g. from the ISP portal) lands |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth |
@@ -169,21 +280,24 @@ Apps therefore implement one endpoint. There is no polling and no cron.
 POST /api/apps/register
 Content-Type: application/json
 
-{ "client_secret": "<ID_CLIENT_SECRET>",
-  "name": "EchoWeb",
+{ "name": "EchoWeb",
   "webhook_url": "https://app.X.TLD/id/events" }
 ```
 
 ```json
 { "ok": true, "origin": "https://app.X.TLD", "secret": "…",
-  "events": ["ping", "session.revoked", "user.merged", "identity.linked", "identity.unlinked"] }
+  "events": ["ping", "session.revoked", "user.merged", "identity.linked", "identity.unlinked"],
+  "signature": { "header": "X-Id-Signature", "required": false } }
 ```
 
-`webhook_url` must be https and under `PARENT_DOMAIN` — the same rule as a
-`redirect_uri`. The returned `secret` signs deliveries to this app; it is
-minted once and returned on every registration, so hold it in memory rather
-than configuring it. id immediately queues a `ping` so a broken endpoint
-shows up now rather than at the first real revocation.
+The call is admitted by network trust (the app server's IP), like every
+server-only endpoint. `webhook_url` must be https and under
+`PARENT_DOMAIN` — the same rule as a `redirect_uri`. The returned `secret`
+is the **legacy** delivery-signing key: deliveries still carry a signature
+when the app holds one, but verifying it is optional in the POC — the
+receiving endpoint's own IP allowlist plus TLS is the trust story. id
+immediately queues a `ping` so a broken endpoint shows up now rather than
+at the first real revocation.
 
 ### 2. Receive events
 
@@ -200,15 +314,16 @@ X-Id-Signature: sha256=<hex>
 
 A receiver **must**:
 
-- verify `X-Id-Signature` as `HMAC-SHA256(secret, "<X-Id-Timestamp>.<rawBody>")`
-  against the **raw** body — not a re-serialised object;
-- compare in constant time;
-- reject a timestamp more than **300s** from now (the timestamp is inside
-  the MAC, so this is what stops a captured delivery being replayed);
-- be **idempotent** — failures are retried, so the same event id can arrive
-  more than once;
+- allowlist id's egress IPv4/CIDRs at its ingress (the POC trust model —
+  TLS protects the transport);
+- be **idempotent**, deduplicating on the event `id` — failures are
+  retried, so the same event id can arrive more than once;
 - answer **2xx only once the event is durably handled**. Anything else, or a
   timeout past 10s, counts as a failure.
+
+A receiver **may** additionally verify the legacy `X-Id-Signature` header
+(`HMAC-SHA256(secret, "<X-Id-Timestamp>.<rawBody>")` over the **raw** body,
+constant-time compare, timestamp within **300s**) — optional in the POC.
 
 Retries back off at 0s, 30s, 2m, 10m, 1h, 6h and are then abandoned and
 shown in the dashboard.
@@ -228,10 +343,10 @@ processed:
 
 ```http
 GET /api/events?since=1234
-X-Id-Client-Secret: <ID_CLIENT_SECRET>
 ```
 
-Combined with idempotent handlers, that closes the gap without a timer.
+(Admitted by network trust, like every server-only call.) Combined with
+idempotent handlers, that closes the gap without a timer.
 
 ### Reference verification
 
@@ -286,14 +401,54 @@ so no schema change is needed.
 
 ## Storage
 
-Identity data lives in MySQL (`id_db`; canonical schema in
-`EchoDatabase/init`, and `ensureSchema()` creates it idempotently at boot):
+Identity data lives in MySQL (`id_db`) — the shared platform identity
+database on **LSAidaOffice01** — and **this repository is its sole schema
+owner**. There is no external schema source: `EchoDatabase/init` is not
+used and must not be. `id_db.id_tbl_User.iUserId` is the platform-wide
+person id; tenant, role, extension, and prompt data belong to the
+applications (e.g. Aida UID mappings in NocoDB), never as columns here.
 
 - `id_tbl_User` — people
 - `id_tbl_Identity` — login methods per user (`provider`, `subject`)
 - `id_tbl_Session` — revocable, non-expiring SSO sessions
 - `id_tbl_AuthCode` — one-time app handoff codes
+- `id_tbl_App` / `id_tbl_Event` / `id_tbl_Delivery` — app registry & events
 - `id_tbl_SsoNonce` — UISP bridge replay guard
+- `id_tbl_DirectoryKey` — directory-ensure idempotency keys
+- `id_tbl_Migration` — applied-migration history
+
+### Migrations
+
+The schema is applied at boot by `src/migrations.ts`: an ordered,
+append-only list of named, **additive** migrations, each recorded in
+`id_tbl_Migration`. A fresh database gets everything; an existing one gets
+only what it has not seen; a second run is a no-op; concurrent boots are
+serialised by an advisory lock. The baseline migration is written as
+`CREATE TABLE IF NOT EXISTS`, so a database created by an earlier
+deployment adopts the history without touching existing rows — existing
+users keep their `iUserId` and keep authenticating.
+
+To change the schema, append a new named migration; never edit, rename, or
+reorder a released one.
+
+**Local vs production.** `docker-compose.yml` / `.env.example` describe a
+disposable local MySQL for development and tests. Production is the shared
+`id_db` on LSAidaOffice01 (`DB_HOST` pointing at that MySQL) — treat it as
+live data at all times.
+
+**Backup / restore / rollback (production).** Take a consistent dump
+before every deploy that includes a new migration:
+
+```bash
+mysqldump --single-transaction --routines id_db > id_db-$(date +%F).sql   # backup
+mysql id_db < id_db-<date>.sql                                            # restore
+```
+
+Because migrations are additive, rolling back the *app* to a previous
+version is always safe (older code ignores newer tables/columns). Rolling
+back the *schema* means restoring the dump taken before the deploy —
+accept the data written in between as lost, which is why the dump comes
+first.
 
 ## Development
 

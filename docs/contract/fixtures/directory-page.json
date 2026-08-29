@@ -1,0 +1,8 @@
+{
+  "$schema": "DirectoryPage",
+  "items": [
+    { "iUserId": 7, "email": "ada@x.tld", "displayName": "Ada Lovelace", "claimed": true },
+    { "iUserId": 12, "email": "new.hire@x.tld", "displayName": "New Hire", "claimed": false }
+  ],
+  "nextCursor": null
+}

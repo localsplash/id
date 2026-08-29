@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Build, tests & contract validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc -p tsconfig.json --noEmit
+      # Runs the unit suite AND the contract tests (fixtures vs
+      # docs/openapi.json, pinned POC invariants, event-type parity).
+      - run: npm test
+
+  migrations:
+    name: id_db migrations (clean install, upgrade, no-op)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: citest
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pcitest"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run src/migrations.integration.test.ts
+        env:
+          TEST_DB_URL: mysql://root:citest@127.0.0.1:3306/id_db_migration_test
+
+  contract-breaking:
+    name: Contract breaking-change gate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Extract the base branch's contract
+        id: base
+        run: |
+          if git cat-file -e "origin/${GITHUB_BASE_REF}:docs/openapi.json" 2>/dev/null; then
+            git show "origin/${GITHUB_BASE_REF}:docs/openapi.json" > .ci-base-openapi.json
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No contract on the base branch yet - nothing to diff against."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Reject incompatible contract changes
+        if: steps.base.outputs.exists == 'true'
+        run: >
+          docker run --rm -v "$PWD:/specs:ro" tufin/oasdiff breaking
+          /specs/.ci-base-openapi.json /specs/docs/openapi.json
+          --fail-on ERR

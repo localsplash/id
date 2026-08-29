@@ -1,14 +1,34 @@
 import { buildApp } from './app';
 import { loadConfig } from './config';
-import { ensureSchema } from './db';
+import { runMigrations } from './migrations';
+import { parseCidrList } from './net';
 import { drainDeliveries } from './webhooks';
 
 async function main() {
   const config = loadConfig();
+
+  // Network trust is security configuration: a malformed CIDR entry or an
+  // empty allowlist in a CIDR-mode production deployment must stop the
+  // process at startup, not fail requests ambiguously at runtime.
+  const appCidrs = parseCidrList(config.ID_TRUSTED_APP_CIDRS);
+  parseCidrList(config.ID_TRUSTED_PROXY_CIDRS);
+  if (
+    config.NODE_ENV === 'production' &&
+    config.ID_APP_AUTH_MODE !== 'secret' &&
+    appCidrs.length === 0
+  ) {
+    throw new Error(
+      `ID_APP_AUTH_MODE=${config.ID_APP_AUTH_MODE} requires a non-empty ` +
+        'ID_TRUSTED_APP_CIDRS allowlist in production'
+    );
+  }
+
   const { app, db, settingsStore } = buildApp();
 
-  // Identity tables (idempotent; canonical copy lives in EchoDatabase/init).
-  await ensureSchema(db);
+  // id_db schema — this repo is the sole owner; versioned, additive,
+  // recorded migrations (a second run is a no-op).
+  const applied = await runMigrations(db);
+  if (applied.length) console.log(`[db] applied migrations: ${applied.join(', ')}`);
 
   // Best-effort: create/seed the oAuthConfig table in NocoDB. NocoDB may
   // still be starting or the token may not exist yet — the app must come up
