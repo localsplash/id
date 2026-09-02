@@ -2,14 +2,14 @@
 
 `id` is the single sign-in surface for every application under one parent
 domain (`X.TLD`). Applications never talk to Google, Microsoft, or the UISP
-bridge themselves — they redirect the browser to `id.X.TLD`, and `id` hands
+bridge themselves — they redirect the browser to `identity.X.TLD`, and `id` hands
 back a one-time code that resolves to the signed-in identity.
 
 ```
- ┌────────────┐  1. no session → 302   ┌────────────┐
- │ echo.X.TLD │ ─────────────────────▶ │  id.X.TLD  │──▶ Google / Microsoft /
- │ aida.X.TLD │                        │            │◀── UISP bridge plugin
- └────────────┘ ◀───────────────────── └────────────┘
+ ┌────────────┐  1. no session → 302   ┌──────────────────┐
+ │ echo.X.TLD │ ─────────────────────▶ │ identity.X.TLD   │──▶ Google / Microsoft /
+ │ aida.X.TLD │                        │                  │◀── UISP bridge plugin
+ └────────────┘ ◀───────────────────── └──────────────────┘
        │         2. 302 back with            │
        │            one-time ?code           │ SSO cookie on .X.TLD
        │                                     ▼
@@ -21,7 +21,7 @@ back a one-time code that resolves to the signed-in identity.
 **Application login.** An app with no local session sends the browser to
 
 ```
-GET https://id.X.TLD/authorize?redirect_uri=https://app.X.TLD/auth/callback&state=<opaque>
+GET https://identity.X.TLD/authorize?redirect_uri=https://app.X.TLD/auth/callback&state=<opaque>
 ```
 
 `redirect_uri` must be an https URL whose host is the parent domain or any
@@ -34,7 +34,7 @@ is shown and the round trip completes after the user authenticates.
 The app then redeems the code server-to-server:
 
 ```
-POST https://id.X.TLD/api/token
+POST https://identity.X.TLD/api/token
 { "code": "…", "redirect_uri": "https://app.X.TLD/auth/callback" }
 
 → { "user": { "iUserId", "email", "displayName", "superAdmin" },
@@ -60,8 +60,11 @@ recalculates privilege from the email.
 The server-only endpoints — `POST /api/token`, `POST /api/apps/register`,
 `GET /api/events`, and everything under `/api/directory/` — accept a
 request only when the caller's resolved IPv4 peer is inside
-`ID_TRUSTED_APP_CIDRS` (comma-separated IPv4 CIDRs; `/32` and bare
-addresses accepted). Browser authorization stays public.
+`ID_TRUSTED_NETWORK` — one IPv4 CIDR naming the network the platform's
+servers sit on (`/32` and bare addresses accepted; a comma-separated list
+is still parsed for servers that straddle two ranges, and the pre-rollout
+name `ID_TRUSTED_APP_CIDRS` is still honoured). It describes a *network*,
+not an application. Browser authorization stays public.
 
 Resolution rules, applied deterministically:
 
@@ -76,7 +79,7 @@ Resolution rules, applied deterministically:
 - Denials are a generic `403 { "error": "Forbidden", "correlationId" }`;
   the log line carrying that correlation id records the resolved peer IP.
 - In production, startup **fails** when `ID_APP_AUTH_MODE` needs CIDRs and
-  `ID_TRUSTED_APP_CIDRS` is empty, and when any CIDR entry is malformed.
+  `ID_TRUSTED_NETWORK` is empty, and when any CIDR entry is malformed.
 
 `ID_APP_AUTH_MODE` is the rollout flag: `cidr` (POC default), `secret`
 (legacy `ID_CLIENT_SECRET` only), or `dual` (either accepted) for the
@@ -171,14 +174,29 @@ user entered straight from the portal.
 
 ## Configuration
 
-The `.env` carries **only** bootstrap plumbing: MySQL and NocoDB
-coordinates (see `.env.example`). Every application-level setting lives in
-the **`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`:
+**Zero-config is the intended path.** A fresh instance is expected at
+`identity.X.TLD` and works out of the box. The `.env` carries three things
+and nothing else (see `.env.example`):
+
+| Variable | Why it cannot live in the settings table |
+| --- | --- |
+| `NOCODB_BASE_URL` | Where the settings table is |
+| `NOCODB_API_TOKEN` | How to read it |
+| `ID_TRUSTED_NETWORK` | Which network is trusted — a security boundary, not a setting an admin edits through a web page |
+
+Everything else — **the MySQL coordinates included** — is a row in the
+**`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`, so a
+deployment is described in one place rather than split between a file on a
+host and a table. The settings table is created empty on first boot, and
+the setup wizard fills in where this service lives from the URL the first
+admin actually opens it on. `identity.X.TLD` is the one assumption the code
+makes; nothing else about a deployment is defaulted anywhere in the source.
 
 | Key | Purpose |
 | --- | --- |
+| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | The MySQL id_db this app owns and migrates itself. Required — set them here (or in the environment) before first run; a change takes a restart |
 | `PARENT_DOMAIN` | Apex domain (`X.TLD`) the **apps** are served from; drives the cookie scope and redirect allowlist, and is the default super-admin domain |
-| `APP_BASE_URL` | Public base URL of this app, e.g. `https://id.X.TLD` |
+| `APP_BASE_URL` | Public base URL of this app, e.g. `https://identity.X.TLD`. Normally left to the wizard — see *Where this service thinks it lives* below |
 | `ID_CLIENT_SECRET` | **Legacy (rollout only)** — shared secret apps present at `/api/token` when `ID_APP_AUTH_MODE` is `secret`/`dual`; ignored in the default `cidr` mode |
 | `SUPERADMIN_DOMAIN` | Domain(s) the **identity provider vouches for** whose users are Super System Admins — comma-separated list accepted (default: `PARENT_DOMAIN`) |
 | `DEFAULT_REDIRECT_URI` | Where an unsolicited sign-in (e.g. from the ISP portal) lands |
@@ -187,12 +205,45 @@ the **`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`:
 | `UISP_SSO_SECRET` / `UISP_PLUGIN_URL` / `UISP_BASE_URL` / `UISP_CRM_APP_KEY_READ` | UISP bridge & CRM |
 
 On first boot `id` creates the base/table and seeds every known key with an
-empty value and a description, so the menu of settings is visible without
-guessing. **A login method is only offered when all of its required keys are
-set** — an unconfigured provider simply does not appear on the login page.
+**empty** value and a description, so the menu of settings is visible
+without guessing. Seeded rows stay empty on purpose: a database being
+created for the first time is not where a public URL or a domain gets
+invented. **A login method is only offered when all of its required keys
+are set** — an unconfigured provider simply does not appear on the login
+page.
 
 Settings are re-read at most every 30 seconds; changes in NocoDB take
 effect without a restart.
+
+### Environment overrides
+
+Any key in the table above may also be set in the **environment**, where it
+wins over the stored row. That is the escape hatch for deployments that
+manage configuration as environment (a Helm chart, a CI secret) or that
+need an instance up before NocoDB exists at all — it is an override, not a
+default, and the zero-config path leaves all of it unset.
+
+An overridden key is read-only in `/admin` (tagged `env`, with a `409` on
+any attempt to write it) and is never copied into the store, since a copy
+would go stale the moment the environment changed. Blank counts as unset,
+so an empty variable in a compose file does not shadow the store.
+
+### Where this service thinks it lives
+
+`APP_BASE_URL` is what the OAuth callback URIs are built from, and it is
+resolved per request in this order:
+
+1. the environment override, if there is one;
+2. the `APP_BASE_URL` row in `oAuthConfig` — what the setup wizard wrote;
+3. the URL the browser actually reached this service on (honouring
+   `X-Forwarded-Proto` / `X-Forwarded-Host` from a reverse proxy);
+4. `https://identity.<PARENT_DOMAIN>` — the naming convention, for the rare
+   call with no request to observe.
+
+Leave 1 and 2 unset and the service is simply correct about itself: it is
+reachable at exactly the URL that reached it. `PARENT_DOMAIN` follows the
+same convention in the wizard — this host minus its own label, so
+`identity.wisp.net` proposes `wisp.net`.
 
 ### First-run setup wizard
 
@@ -200,13 +251,20 @@ While no OAuth provider is configured, the instance is **unclaimed**: `/`
 redirects to `/setup`, a built-in wizard that walks the first admin through
 claiming it:
 
-1. It checks the NocoDB settings store first — if `NOCODB_API_TOKEN` (or
-   `NOCODB_BASE_URL`) is missing or wrong, the wizard says exactly that:
-   those two must be set in the environment before anything can be saved.
-2. The admin enters the application domain (`X.TLD`) and credentials for
-   **Google or Microsoft** (the wizard is limited to providers that can
-   prove a domain; Microsoft additionally requires a tenant ID — `common`
-   cannot prove anything). A Super Admin domain can be given too, but it is
+1. It checks both stores first and names the one that is missing: if
+   `NOCODB_API_TOKEN` or `NOCODB_BASE_URL` is missing or wrong, those two
+   must be set in the environment before anything can be saved; if the
+   `DB_*` rows are unset or MySQL will not answer, the claim has nowhere to
+   record its first user. No form is shown until both answer.
+2. The wizard fills in this service's public URL from the browser's own
+   address bar and the application domain from that host minus its label
+   (`identity.wisp.net` → `wisp.net`) — both editable, neither guessed
+   server-side, and both fixed and read-only when the environment pins
+   them. The admin confirms the application domain (`X.TLD`) and enters
+   credentials for **Google or Microsoft** (the wizard is limited to
+   providers that can prove a domain; Microsoft additionally requires a
+   tenant ID — `common` cannot prove anything). In production the service
+   URL must be on the domain being claimed. A Super Admin domain can be given too, but it is
    optional — see below.
 3. The credentials are held in a short-lived cookie — *not* saved — while a
    real OAuth round trip runs against them.
@@ -417,6 +475,15 @@ applications (e.g. Aida UID mappings in NocoDB), never as columns here.
 - `id_tbl_DirectoryKey` — directory-ensure idempotency keys
 - `id_tbl_Migration` — applied-migration history
 
+**Where its coordinates come from.** `DB_HOST` / `DB_PORT` / `DB_USER` /
+`DB_PASSWORD` / `DB_NAME` are settings like any other — rows in
+`oAuthConfig`, or environment overrides — so a deployment is described in
+one place. The pool connects lazily on first use, which makes "not filled
+in yet" an ordinary first-run state rather than a crash: the app still
+listens, `/setup` says which of the two stores is missing, and the schema is
+applied as soon as the coordinates work. A change of coordinates takes a
+restart.
+
 ### Migrations
 
 The schema is applied at boot by `src/migrations.ts`: an ordered,
@@ -431,8 +498,9 @@ users keep their `iUserId` and keep authenticating.
 To change the schema, append a new named migration; never edit, rename, or
 reorder a released one.
 
-**Local vs production.** `docker-compose.yml` / `.env.example` describe a
-disposable local MySQL for development and tests. Production is the shared
+**Local vs production.** `docker-compose.yml` / `.env.example` show how to
+point a dev instance at a disposable local MySQL (export `DB_HOST` and
+friends, or fill the rows in NocoDB once). Production is the shared
 `id_db` on LSAidaOffice01 (`DB_HOST` pointing at that MySQL) — treat it as
 live data at all times.
 

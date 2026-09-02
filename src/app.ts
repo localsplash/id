@@ -3,7 +3,7 @@ import path from 'path';
 import pinoHttp from 'pino-http';
 import pino from 'pino';
 import { loadConfig } from './config';
-import { getDb } from './db';
+import { getDb, dbCoordinates } from './db';
 import { SettingsStore, Settings } from './settings';
 import {
   PROVIDERS,
@@ -37,9 +37,12 @@ import {
   setSetupCookie,
   clearSetupCookie,
   getSetupFromCookie,
-  suggestParentDomain,
   isValidDomain,
   isValidDomainList,
+  normalizeBaseUrl,
+  identityBaseUrl,
+  isHostUnderDomain,
+  IDENTITY_HOST_LABEL,
 } from './web';
 import * as store from './store';
 import { parseCidrList, resolveClientIp, ipInCidrs } from './net';
@@ -49,9 +52,13 @@ const publicDir = path.join(__dirname, '..', 'public');
 
 export function buildApp() {
   const config = loadConfig();
-  const db = getDb(config);
   const settingsStore = new SettingsStore(config);
   const logger = pino({ level: config.LOG_LEVEL });
+  // The MySQL coordinates are settings too, so the pool cannot be built
+  // until the store has been read — it connects on first use instead.
+  // getSettings() rather than the store directly, so an environment-pinned
+  // database still connects while NocoDB is down.
+  const db = getDb(async () => dbCoordinates(await getSettings()));
   const app = express();
 
   app.use(express.json({ limit: '256kb' }));
@@ -70,15 +77,69 @@ export function buildApp() {
       return await settingsStore.getAll();
     } catch (err) {
       logger.error({ err }, '[settings] NocoDB read failed');
-      return {};
+      // Whatever the environment pins is still true when the store is not
+      // reachable; the rest reads as "nothing configured", so the login page
+      // honestly shows no methods rather than the app crashing.
+      return settingsStore.fromEnvOnly();
     }
   }
 
+  /**
+   * The public base URL of this service, resolved per request:
+   *
+   *   1. APP_BASE_URL — the environment override if there is one, otherwise
+   *      the settings row the wizard wrote;
+   *   2. the URL the browser actually reached us on (the proxy's forwarding
+   *      headers when it sits in front, the socket's own Host otherwise) —
+   *      the zero-config path, and always correct by construction;
+   *   3. identity.<PARENT_DOMAIN>, the naming convention, for the rare call
+   *      that has no usable request to observe.
+   *
+   * Nothing else is invented: with no setting, no host header and no parent
+   * domain there is no honest answer, and the empty string says so.
+   */
   function baseUrl(settings: Settings, req: express.Request): string {
-    if (settings.APP_BASE_URL) return settings.APP_BASE_URL.replace(/\/+$/, '');
+    const configured = normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true });
+    if (configured) return configured;
     const proto = String(req.headers['x-forwarded-proto'] ?? req.protocol ?? 'https').split(',')[0];
-    const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? '');
-    return `${proto}://${host}`;
+    const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? '').split(',')[0];
+    const observed = normalizeBaseUrl(`${proto.trim()}://${host.trim()}`, { allowHttp: true });
+    if (observed) return observed;
+    return identityBaseUrl(settings.PARENT_DOMAIN ?? '');
+  }
+
+  /**
+   * Is id_db usable? The coordinates are settings, so "not configured yet"
+   * is an ordinary first-run state rather than a crash — and the wizard has
+   * to be able to say which of the two stores is missing.
+   */
+  async function probeDatabase(): Promise<{
+    state: 'ok' | 'unconfigured' | 'unreachable';
+    hint?: string;
+  }> {
+    const settings = await getSettings();
+    if (!dbCoordinates(settings)) {
+      return {
+        state: 'unconfigured',
+        hint:
+          'The id_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME ' +
+          `(and DB_PASSWORD) in the ${config.NOCODB_TABLE_NAME} table in NocoDB, ` +
+          "or set them in this app's environment, then restart.",
+      };
+    }
+    try {
+      await db.query('SELECT 1');
+      return { state: 'ok' };
+    } catch (err) {
+      logger.error({ err }, '[db] probe failed');
+      return {
+        state: 'unreachable',
+        hint:
+          `MySQL at ${settings.DB_HOST} did not accept the connection. Check the ` +
+          'DB_* settings (host, port, user, password, database) and that this ' +
+          'host may reach it.',
+      };
+    }
   }
 
   async function resolveSession(req: express.Request): Promise<store.SessionRow | null> {
@@ -95,7 +156,7 @@ export function buildApp() {
   // apps sharing an allowed egress IP can call the same endpoints, which is
   // accepted for the first-party POC on a controlled host. ID_APP_AUTH_MODE
   // keeps the legacy ID_CLIENT_SECRET check available during rollout.
-  const appCidrs = parseCidrList(config.ID_TRUSTED_APP_CIDRS);
+  const appCidrs = parseCidrList(config.ID_TRUSTED_NETWORK);
   const proxyCidrs = parseCidrList(config.ID_TRUSTED_PROXY_CIDRS);
 
   /** True when the request's resolved IPv4 peer is inside the app allowlist. */
@@ -330,6 +391,10 @@ export function buildApp() {
       }
     }
 
+    // The identity data has to be writable before anyone can claim the
+    // instance — the claimer becomes the first row in id_tbl_User.
+    const database = await probeDatabase();
+
     // A claim already in flight: enough to rebuild the request without
     // making the admin retype anything. Never the client secret — the server
     // reuses the one held in the cookie.
@@ -344,22 +409,82 @@ export function buildApp() {
         }
       : null;
 
-    const base = baseUrl(settings, req);
+    // Deliberately no server-side guesses here. The wizard runs in the
+    // browser that reached this service, and that browser's own URL is the
+    // best available statement of where this service lives — better than
+    // anything reconstructed from headers. Only values that are already
+    // pinned are sent: an environment override (which the wizard must not
+    // let anyone contradict) or a row already in the store.
     return res.json({
       unclaimed: isUnclaimed(settings),
       nocodb,
       nocodbHint,
+      database: database.state,
+      databaseHint: database.hint,
       pending,
-      suggested: {
-        parentDomain: settings.PARENT_DOMAIN ?? suggestParentDomain(String(req.headers.host ?? '')),
-        appBaseUrl: base,
+      pinned: {
+        appBaseUrl: normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true }) ?? '',
+        parentDomain: settings.PARENT_DOMAIN ?? '',
       },
-      callbackUrls: {
-        google: `${base}/auth/google/callback`,
-        microsoft: `${base}/auth/microsoft/callback`,
+      locked: {
+        appBaseUrl: settingsStore.isOverridden('APP_BASE_URL'),
+        parentDomain: settingsStore.isOverridden('PARENT_DOMAIN'),
       },
+      // The convention the wizard shows when it has to name an expected
+      // shape ("identity.example.com") — the one default in this codebase.
+      identityHostLabel: IDENTITY_HOST_LABEL,
     });
   });
+
+  /**
+   * The base URL the wizard is claiming this service on.
+   *
+   * The browser sends its own origin, which is the whole point: the person
+   * setting up is looking at the URL that has to work, so nothing has to be
+   * guessed or typed. It is still validated — it ends up in the OAuth
+   * redirect_uri and in the settings store — and an environment override
+   * always wins over whatever arrives.
+   *
+   * Returns the URL, or a message explaining why it cannot be used.
+   */
+  function resolveSetupBaseUrl(
+    settings: Settings,
+    req: express.Request,
+    submitted: string,
+    parentDomain: string
+  ): { url: string } | { error: string } {
+    const production = config.NODE_ENV === 'production';
+    if (settingsStore.isOverridden('APP_BASE_URL')) {
+      const pinned = normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true });
+      return pinned
+        ? { url: pinned }
+        : { error: "APP_BASE_URL is set in this app's environment but is not a valid URL." };
+    }
+
+    const raw = submitted.trim();
+    const url = raw
+      ? normalizeBaseUrl(raw, { allowHttp: !production })
+      : baseUrl(settings, req); // no browser value: fall back to this request
+    if (!url) {
+      return {
+        error: production
+          ? 'The service URL must be an https:// URL, e.g. ' +
+            `https://${IDENTITY_HOST_LABEL}.${parentDomain}.`
+          : `Enter a valid service URL, e.g. https://${IDENTITY_HOST_LABEL}.${parentDomain}.`,
+      };
+    }
+    // In production the service must live under the domain being claimed —
+    // the OAuth callback and the SSO cookie both depend on it. Development
+    // routinely runs on localhost against a real domain, so it is exempt.
+    if (production && !isHostUnderDomain(new URL(url).hostname, parentDomain)) {
+      return {
+        error:
+          `The service URL must be on ${parentDomain} — the domain you are claiming — ` +
+          `e.g. https://${IDENTITY_HOST_LABEL}.${parentDomain}.`,
+      };
+    }
+    return { url };
+  }
 
   /**
    * Step 2 of the wizard: hold the typed-in credentials in a short-lived
@@ -387,6 +512,11 @@ export function buildApp() {
         return res.status(503).json({
           error: `NocoDB at ${config.NOCODB_BASE_URL} is unreachable or rejected the token — fix the environment first.`,
         });
+      }
+
+      const database = await probeDatabase();
+      if (database.state !== 'ok') {
+        return res.status(503).json({ error: database.hint });
       }
 
       const body = (req.body ?? {}) as Record<string, string>;
@@ -429,11 +559,19 @@ export function buildApp() {
         });
       }
 
+      const resolvedBase = resolveSetupBaseUrl(
+        settings,
+        req,
+        String(body.appBaseUrl ?? ''),
+        parentDomain
+      );
+      if ('error' in resolvedBase) return res.status(400).json({ error: resolvedBase.error });
+
       const setup: SetupRequest = {
         csrf: store.generateId(16),
         parentDomain,
         adminDomain: adminDomain || undefined,
-        appBaseUrl: baseUrl(settings, req),
+        appBaseUrl: resolvedBase.url,
         provider: providerId,
         clientId,
         clientSecret,
@@ -475,7 +613,9 @@ export function buildApp() {
     } else {
       candidate.MICROSOFT_CLIENT_ID = setup.clientId;
       candidate.MICROSOFT_CLIENT_SECRET = setup.clientSecret;
-      candidate.MICROSOFT_TENANT = setup.tenant ?? 'common';
+      // Required by the validation above — the wizard only accepts a
+      // tenant-locked Microsoft app, since 'common' cannot prove a domain.
+      candidate.MICROSOFT_TENANT = setup.tenant ?? '';
     }
     return candidate;
   }
@@ -543,6 +683,9 @@ export function buildApp() {
     // exchange secret is minted here so apps have one from day one.
     await settingsStore.bootstrap();
     for (const [key, value] of Object.entries(candidate)) {
+      // A key the environment pins is already in force and is not the
+      // store's to hold — writing it would only create a stale copy.
+      if (settingsStore.isOverridden(key)) continue;
       await settingsStore.set(key, value);
     }
     if (!current.ID_CLIENT_SECRET) {
@@ -822,7 +965,7 @@ export function buildApp() {
    *
    * The application proves the code was addressed to it (redirect_uri must
    * match what the code was minted for) and that it is one of ours: in the
-   * POC its server's IPv4 peer is inside ID_TRUSTED_APP_CIDRS (the legacy
+   * POC its server's IPv4 peer is inside ID_TRUSTED_NETWORK (the legacy
    * ID_CLIENT_SECRET check remains available via ID_APP_AUTH_MODE during
    * rollout). Codes are single-use and expire in 5 minutes.
    *
@@ -1149,6 +1292,10 @@ export function buildApp() {
       const rows = await settingsStore.listForAdmin();
       const settings = await getSettings();
       const base = baseUrl(settings, req);
+      // What is actually deciding `base` — a pinned value only counts when
+      // it is usable; an unparseable one falls through to the request like
+      // any other missing setting.
+      const pinnedBase = normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true });
       const knownProviders = PROVIDERS.map((p) => ({
         id: p.id,
         label: p.label,
@@ -1161,6 +1308,14 @@ export function buildApp() {
         items: rows,
         providers: knownProviders,
         appBaseUrl: base,
+        // Empty when nothing pins APP_BASE_URL — the callback URLs above
+        // then follow the URL this console was reached on, which is what a
+        // zero-config instance runs on.
+        appBaseUrlSource: pinnedBase
+          ? settingsStore.isOverridden('APP_BASE_URL')
+            ? 'environment'
+            : 'store'
+          : 'request',
         // Resolved rather than raw, so the list form and the PARENT_DOMAIN
         // fallback are both visible for what they are.
         superAdminDomains: superAdminDomains(settings),
@@ -1177,6 +1332,16 @@ export function buildApp() {
       const key = String(req.params.key ?? '').trim();
       if (!/^[A-Za-z0-9_.-]{1,128}$/.test(key)) {
         return res.status(400).json({ error: 'Invalid key' });
+      }
+      // An environment override is the deployment's decision, not this
+      // console's: saying so beats accepting a write that would never take
+      // effect.
+      if (settingsStore.isOverridden(key)) {
+        return res.status(409).json({
+          error:
+            `${key} is set in this app's environment, which overrides the settings ` +
+            'store. Change it there (and restart) or unset it to manage it here.',
+        });
       }
       const value = String((req.body ?? {}).value ?? '');
       await settingsStore.set(key, value);

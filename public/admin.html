@@ -45,6 +45,8 @@
       <p class="text-xs text-slate-500 mb-4">
         Stored in NocoDB. A login method appears on the sign-in page only when all
         of its required keys are set. Values marked secret are write-only here.
+        A key tagged <span class="font-mono">env</span> is pinned in this app's
+        environment, which overrides the store — change it there and restart.
       </p>
       <div id="config" class="space-y-3"></div>
     </div>
@@ -131,7 +133,7 @@ X-Id-Signature: sha256=&lt;hex&gt;
         'Platform "Web" → "Redirect URIs".',
     };
 
-    function renderCallbacks(providers, appBaseUrl) {
+    function renderCallbacks(providers, appBaseUrl, source) {
       const wrap = document.getElementById('callbacks');
       wrap.innerHTML = '';
       for (const p of providers) {
@@ -151,24 +153,32 @@ X-Id-Signature: sha256=&lt;hex&gt;
       }
       const origin = document.createElement('p');
       origin.className = 'text-[11px] text-slate-400 mt-1';
-      origin.textContent = `App base URL (JavaScript origin for Google): ${appBaseUrl}`;
+      const provenance = {
+        environment: ' — pinned by APP_BASE_URL in the environment',
+        store: ' — from the APP_BASE_URL setting below',
+        request: ' — the URL this console was reached on; set APP_BASE_URL below to pin it',
+      }[source] || '';
+      origin.textContent =
+        `App base URL (JavaScript origin for Google): ${appBaseUrl}${provenance}`;
       wrap.appendChild(origin);
     }
 
     async function loadConfig() {
       const resp = await fetch('/api/admin/config');
       if (resp.status === 403) { location.href = '/'; return; }
-      const { items, providers, appBaseUrl } = await resp.json();
-      renderCallbacks(providers || [], appBaseUrl || '');
+      const { items, providers, appBaseUrl, appBaseUrlSource } = await resp.json();
+      renderCallbacks(providers || [], appBaseUrl || '', appBaseUrlSource || '');
       const wrap = document.getElementById('config');
       wrap.innerHTML = '';
       for (const row of items) {
         const secret = SECRET_RE.test(row.key);
+        const fromEnv = row.source === 'environment';
         const div = document.createElement('div');
         div.className = 'flex flex-col sm:flex-row sm:items-center gap-2';
         div.innerHTML = `
           <div class="sm:w-64 flex-shrink-0">
             <span class="text-sm font-medium text-slate-700 font-mono">${esc(row.key)}</span>
+            ${fromEnv ? '<span class="ml-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-mono align-middle">env</span>' : ''}
             <span class="block text-[11px] text-slate-400 leading-tight">${esc(row.description || '')}</span>
           </div>`;
         const input = document.createElement('input');
@@ -176,16 +186,30 @@ X-Id-Signature: sha256=&lt;hex&gt;
         input.placeholder = secret && row.value ? '••••••• (set)' : row.value ? '' : '(not set)';
         input.value = secret ? '' : row.value;
         input.className = 'flex-1 px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono';
+        // Pinned in the environment: show what is in force, but do not offer
+        // an edit that the store would accept and the app would ignore.
+        if (fromEnv) {
+          input.readOnly = true;
+          input.className += ' bg-slate-50 text-slate-500';
+          input.title = "Set in this app's environment; edit it there and restart.";
+        }
         const btn = document.createElement('button');
         btn.textContent = 'Save';
-        btn.className = 'px-3 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700';
+        btn.className = fromEnv
+          ? 'px-3 py-2 rounded-lg bg-slate-200 text-slate-400 text-sm cursor-not-allowed'
+          : 'px-3 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700';
+        btn.disabled = fromEnv;
         btn.onclick = async () => {
           const r = await fetch(`/api/admin/config/${encodeURIComponent(row.key)}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ value: input.value }),
           });
-          banner(r.ok ? `${row.key} saved.` : `Failed to save ${row.key}.`, r.ok);
+          const body = r.ok ? null : await r.json().catch(() => null);
+          banner(
+            r.ok ? `${row.key} saved.` : (body && body.error) || `Failed to save ${row.key}.`,
+            r.ok
+          );
           if (r.ok) loadConfig();
         };
         div.appendChild(input);

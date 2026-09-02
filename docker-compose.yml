@@ -7,17 +7,27 @@ services:
     container_name: id-web
     environment:
       PORT: "3200"
-      DB_HOST: ${DB_HOST:-host.docker.internal}
-      DB_PORT: ${DB_PORT:-13306}
-      DB_USER: ${DB_USER:-echo_app}
-      DB_PASSWORD: ${DB_PASSWORD:-devpass}
-      DB_NAME: ${DB_NAME:-id_db}
+      # The three things a deployment states: the settings store, its token,
+      # and the trusted network.
       NOCODB_BASE_URL: ${NOCODB_BASE_URL:-http://host.docker.internal:18090}
       NOCODB_API_TOKEN: ${NOCODB_API_TOKEN:-}
-      # POC network trust: allow the docker bridge + loopback in dev.
+      # POC network trust: the docker bridge + loopback in dev.
+      ID_TRUSTED_NETWORK: ${ID_TRUSTED_NETWORK:-127.0.0.1/32,172.16.0.0/12}
       ID_APP_AUTH_MODE: ${ID_APP_AUTH_MODE:-cidr}
-      ID_TRUSTED_APP_CIDRS: ${ID_TRUSTED_APP_CIDRS:-127.0.0.1/32,172.16.0.0/12}
       ID_TRUSTED_PROXY_CIDRS: ${ID_TRUSTED_PROXY_CIDRS:-}
+      # Optional overrides of oAuthConfig rows. Blank counts as unset, so
+      # leaving these alone keeps the zero-config path: the public base URL
+      # is whatever URL the browser reached this service on, and the
+      # database coordinates come from the settings table. Point the dev
+      # stack at its disposable MySQL by exporting DB_HOST/DB_PORT/... in
+      # your shell, or fill the rows in NocoDB once.
+      DB_HOST: ${DB_HOST:-}
+      DB_PORT: ${DB_PORT:-}
+      DB_USER: ${DB_USER:-}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_NAME: ${DB_NAME:-}
+      APP_BASE_URL: ${APP_BASE_URL:-}
+      PARENT_DOMAIN: ${PARENT_DOMAIN:-}
     ports:
       - "127.0.0.1:3200:3200"
     restart: unless-stopped

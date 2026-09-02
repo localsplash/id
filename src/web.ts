@@ -30,6 +30,58 @@ export function secretsMatch(a: string, b: string): boolean {
   return crypto.timingSafeEqual(ha, hb);
 }
 
+// ─── The one convention this codebase assumes ────────────────────────────────
+
+/**
+ * The identity service is expected to be served at identity.X.TLD — one
+ * label under the domain the applications share.
+ *
+ * This is the *only* default in the code. Everything else about where this
+ * service lives is either pinned in the environment, stored in the settings
+ * table, or observed from the URL the browser used to get here. The label is
+ * used to derive the parent domain from a host, and to name the URL a fresh
+ * instance is expected to answer on when there is no request to observe.
+ */
+export const IDENTITY_HOST_LABEL = 'identity';
+
+/** The canonical public URL for an instance serving `parentDomain`. */
+export function identityBaseUrl(parentDomain: string): string {
+  const domain = parentDomain.trim().toLowerCase().replace(/^\.+/, '');
+  return domain ? `https://${IDENTITY_HOST_LABEL}.${domain}` : '';
+}
+
+/** True when `host` is `domain` itself or any subdomain of it. */
+export function isHostUnderDomain(host: string, domain: string): boolean {
+  const h = host.trim().toLowerCase().split(':')[0];
+  const d = domain.trim().toLowerCase().replace(/^\.+/, '');
+  if (!h || !d) return false;
+  return h === d || h.endsWith(`.${d}`);
+}
+
+/**
+ * Reduce anything that claims to be a base URL to `scheme://host[:port]`,
+ * or null when it is not one. Paths, queries, fragments and trailing
+ * slashes are dropped — a base URL is an origin, and everything downstream
+ * concatenates paths onto it. Credentials in the URL are always a refusal.
+ *
+ * `allowHttp` exists because a real deployment is https, while local
+ * development is not; production callers pass false.
+ */
+export function normalizeBaseUrl(raw: string, opts: { allowHttp?: boolean } = {}): string | null {
+  const trimmed = String(raw ?? '').trim();
+  if (!trimmed) return null;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'https:' && !(opts.allowHttp && url.protocol === 'http:')) return null;
+  if (url.username || url.password) return null;
+  if (!url.hostname) return null;
+  return `${url.protocol}//${url.host}`;
+}
+
 // ─── Redirect validation ──────────────────────────────────────────────────────
 
 /**
@@ -57,8 +109,7 @@ export function validateRedirectUri(
   }
   if (url.username || url.password) return null;
 
-  const host = url.hostname.toLowerCase();
-  if (host !== parentDomain && !host.endsWith(`.${parentDomain}`)) return null;
+  if (!isHostUnderDomain(url.hostname, parentDomain)) return null;
 
   return url.toString();
 }
@@ -220,7 +271,11 @@ export function getSetupFromCookie(req: express.Request): SetupRequest | null {
   }
 }
 
-/** id.wisp.net → wisp.net; a bare or two-label host is returned unchanged. */
+/**
+ * identity.wisp.net → wisp.net: the parent domain is this service's host
+ * minus its own label, per the identity.X.TLD convention. A bare or
+ * two-label host is already apex and is returned unchanged.
+ */
 export function suggestParentDomain(host: string): string {
   const h = host.toLowerCase().split(':')[0];
   const labels = h.split('.');

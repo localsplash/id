@@ -25,6 +25,10 @@ interface FakeSession {
 
 const fake = {
   settings: {} as Record<string, string>,
+  /** Keys the environment pins — they win over `settings` and cannot be written. */
+  overrides: {} as Record<string, string>,
+  /** State of id_db as the wizard's probe would find it. */
+  db: 'ok' as 'ok' | 'unconfigured' | 'unreachable',
   sessions: new Map<string, FakeSession>(),
   authCodes: new Map<
     string,
@@ -37,6 +41,8 @@ const fake = {
 
 function resetFakes() {
   fake.settings = { PARENT_DOMAIN: 'wisp.net' };
+  fake.overrides = {};
+  fake.db = 'ok';
   fake.sessions.clear();
   fake.authCodes.clear();
   fake.users.clear();
@@ -44,15 +50,38 @@ function resetFakes() {
   fake.events = [];
 }
 
-vi.mock('./db', () => ({ getDb: () => ({}) }));
+vi.mock('./db', () => ({
+  getDb: () => ({
+    async query() {
+      if (fake.db === 'unreachable') throw new Error('ECONNREFUSED');
+      return [[{ 1: 1 }], []];
+    },
+  }),
+  // The real one reads DB_HOST/DB_USER/DB_NAME out of the settings, so
+  // "unconfigured" is what a fresh install looks like before anyone fills
+  // the rows in.
+  dbCoordinates: () =>
+    fake.db === 'unconfigured'
+      ? null
+      : { host: 'db.test', port: 3306, user: 'id', password: '', database: 'id_db' },
+}));
 
 vi.mock('./settings', () => {
   class SettingsStore {
     async getAll() {
-      return { ...fake.settings };
+      return { ...fake.settings, ...fake.overrides };
+    }
+    fromEnvOnly() {
+      return { ...fake.overrides };
     }
     async get(key: string) {
-      return fake.settings[key];
+      return { ...fake.settings, ...fake.overrides }[key];
+    }
+    isOverridden(key: string) {
+      return key in fake.overrides;
+    }
+    overriddenKeys() {
+      return Object.keys(fake.overrides);
     }
     invalidate() {}
     isConfigured() {
@@ -61,7 +90,12 @@ vi.mock('./settings', () => {
     async ping() {}
     async bootstrap() {}
     async listForAdmin() {
-      return [];
+      return Object.entries({ ...fake.settings, ...fake.overrides }).map(([key, value]) => ({
+        key,
+        value,
+        description: '',
+        source: key in fake.overrides ? 'environment' : 'store',
+      }));
     }
     async set(key: string, value: string) {
       fake.settings[key] = value;
@@ -166,7 +200,13 @@ vi.mock('./store', () => {
 
 import { buildApp } from './app';
 
-const ENV_KEYS = ['ID_APP_AUTH_MODE', 'ID_TRUSTED_APP_CIDRS', 'ID_TRUSTED_PROXY_CIDRS'] as const;
+const ENV_KEYS = [
+  'ID_APP_AUTH_MODE',
+  'ID_TRUSTED_NETWORK',
+  'ID_TRUSTED_APP_CIDRS',
+  'ID_TRUSTED_PROXY_CIDRS',
+  'NODE_ENV',
+] as const;
 
 function makeApp(env: Partial<Record<(typeof ENV_KEYS)[number], string>>) {
   for (const k of ENV_KEYS) delete process.env[k];
@@ -450,5 +490,199 @@ describe('directory API', () => {
     const res = await request(app).get('/api/directory/users?query=a');
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: 'Forbidden', correlationId: expect.any(String) });
+  });
+});
+
+// ── Zero-config: where this service thinks it lives ──────────────────────────
+
+/**
+ * APP_BASE_URL has three possible answers and a strict order: the
+ * environment override, the settings row, and — when neither exists — the
+ * URL the browser actually used. Nothing else is invented, and the setup
+ * wizard writes down what the browser reported rather than a guess.
+ */
+describe('APP_BASE_URL resolution', () => {
+  const CREDENTIALS = { provider: 'google', clientId: 'gid', clientSecret: 'gsecret' };
+
+  function redirectUriOf(authUrl: string): string {
+    return new URL(authUrl).searchParams.get('redirect_uri') ?? '';
+  }
+
+  it('offers no server-side guess to the wizard, only what is already pinned', async () => {
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const res = await request(app).get('/api/setup/status').set('Host', 'identity.wisp.net');
+    expect(res.status).toBe(200);
+    expect(res.body.pinned).toEqual({ appBaseUrl: '', parentDomain: 'wisp.net' });
+    expect(res.body.locked).toEqual({ appBaseUrl: false, parentDomain: false });
+    expect(res.body.identityHostLabel).toBe('identity');
+  });
+
+  it('reports a pinned value as locked so the wizard cannot contradict it', async () => {
+    fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const res = await request(app).get('/api/setup/status');
+    expect(res.body.pinned.appBaseUrl).toBe('https://identity.wisp.net');
+    expect(res.body.locked.appBaseUrl).toBe(true);
+  });
+
+  it('builds the OAuth callback from the URL the browser reported', async () => {
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const res = await request(app)
+      .post('/api/setup/start')
+      .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net/setup', ...CREDENTIALS });
+    expect(res.status).toBe(200);
+    expect(redirectUriOf(res.body.authUrl)).toBe('https://identity.wisp.net/auth/google/callback');
+  });
+
+  it('falls back to the request when the browser sends nothing', async () => {
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const res = await request(app)
+      .post('/api/setup/start')
+      .set('X-Forwarded-Proto', 'https')
+      .set('X-Forwarded-Host', 'identity.wisp.net')
+      .send({ parentDomain: 'wisp.net', ...CREDENTIALS });
+    expect(res.status).toBe(200);
+    expect(redirectUriOf(res.body.authUrl)).toBe('https://identity.wisp.net/auth/google/callback');
+  });
+
+  it('rejects a base URL that is not one', async () => {
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const res = await request(app)
+      .post('/api/setup/start')
+      .send({ parentDomain: 'wisp.net', appBaseUrl: 'identity.wisp.net', ...CREDENTIALS });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('https://identity.wisp.net');
+  });
+
+  it('in production, refuses a base URL off the domain being claimed', async () => {
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK, NODE_ENV: 'production' });
+    const off = await request(app)
+      .post('/api/setup/start')
+      .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.attacker.example', ...CREDENTIALS });
+    expect(off.status).toBe(400);
+    expect(off.body.error).toContain('wisp.net');
+
+    const on = await request(app)
+      .post('/api/setup/start')
+      .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net', ...CREDENTIALS });
+    expect(on.status).toBe(200);
+  });
+
+  it('lets the environment override win over the browser', async () => {
+    fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const res = await request(app)
+      .post('/api/setup/start')
+      .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://somewhere.else.example', ...CREDENTIALS });
+    expect(res.status).toBe(200);
+    expect(redirectUriOf(res.body.authUrl)).toBe('https://identity.wisp.net/auth/google/callback');
+  });
+});
+
+describe('/admin config and the environment', () => {
+  it('reports each setting with the source that is actually in force', async () => {
+    fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
+    const res = await request(app).get('/api/admin/config').set('Cookie', `id_sso=${session}`);
+    expect(res.status).toBe(200);
+    expect(res.body.appBaseUrl).toBe('https://identity.wisp.net');
+    expect(res.body.appBaseUrlSource).toBe('environment');
+    expect(res.body.items).toContainEqual(
+      expect.objectContaining({ key: 'APP_BASE_URL', source: 'environment' })
+    );
+    expect(res.body.providers[0].callbackUrl).toBe('https://identity.wisp.net/auth/google/callback');
+  });
+
+  it('says the callback URLs follow the request when nothing pins them', async () => {
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
+    const res = await request(app)
+      .get('/api/admin/config')
+      .set('Cookie', `id_sso=${session}`)
+      .set('X-Forwarded-Proto', 'https')
+      .set('X-Forwarded-Host', 'identity.wisp.net');
+    expect(res.body.appBaseUrl).toBe('https://identity.wisp.net');
+    expect(res.body.appBaseUrlSource).toBe('request');
+  });
+
+  it('refuses a write to a key the environment pins, and says why', async () => {
+    fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
+    const res = await request(app)
+      .put('/api/admin/config/APP_BASE_URL')
+      .set('Cookie', `id_sso=${session}`)
+      .send({ value: 'https://elsewhere.wisp.net' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain('environment');
+    expect(fake.settings.APP_BASE_URL).toBeUndefined();
+  });
+});
+
+// ── The .env carries three things; the rest is settings ──────────────────────
+
+describe('trusted network', () => {
+  it('is one CIDR value under ID_TRUSTED_NETWORK', async () => {
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    expect((await request(app).get('/api/events?since=0')).status).toBe(200);
+
+    const elsewhere = makeApp({ ID_TRUSTED_NETWORK: ELSEWHERE });
+    expect((await request(elsewhere).get('/api/events?since=0')).status).toBe(403);
+  });
+
+  it('still honours the pre-rollout ID_TRUSTED_APP_CIDRS name', async () => {
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    expect((await request(app).get('/api/events?since=0')).status).toBe(200);
+  });
+
+  it('prefers the new name when a deployment sets both', async () => {
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK, ID_TRUSTED_APP_CIDRS: ELSEWHERE });
+    expect((await request(app).get('/api/events?since=0')).status).toBe(200);
+  });
+});
+
+/**
+ * The identity database is a setting like any other, so "not filled in yet"
+ * is an ordinary first-run state: the app answers, and the wizard says which
+ * store is missing instead of failing at the moment of the claim.
+ */
+describe('id_db as a setting', () => {
+  const CREDENTIALS = { provider: 'google', clientId: 'gid', clientSecret: 'gsecret' };
+
+  it('tells the wizard the database is not configured yet', async () => {
+    fake.db = 'unconfigured';
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const res = await request(app).get('/api/setup/status');
+    expect(res.status).toBe(200);
+    expect(res.body.database).toBe('unconfigured');
+    expect(res.body.databaseHint).toContain('DB_HOST');
+  });
+
+  it('reports an unreachable database separately from an unset one', async () => {
+    fake.db = 'unreachable';
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const res = await request(app).get('/api/setup/status');
+    expect(res.body.database).toBe('unreachable');
+  });
+
+  it('refuses to start a claim it could not record', async () => {
+    fake.db = 'unconfigured';
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const res = await request(app)
+      .post('/api/setup/start')
+      .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net', ...CREDENTIALS });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toContain('DB_HOST');
+  });
+
+  it('proceeds once both stores answer', async () => {
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const status = await request(app).get('/api/setup/status');
+    expect(status.body.database).toBe('ok');
+    const res = await request(app)
+      .post('/api/setup/start')
+      .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net', ...CREDENTIALS });
+    expect(res.status).toBe(200);
   });
 });
