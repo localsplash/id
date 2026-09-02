@@ -60,8 +60,11 @@ recalculates privilege from the email.
 The server-only endpoints — `POST /api/token`, `POST /api/apps/register`,
 `GET /api/events`, and everything under `/api/directory/` — accept a
 request only when the caller's resolved IPv4 peer is inside
-`ID_TRUSTED_APP_CIDRS` (comma-separated IPv4 CIDRs; `/32` and bare
-addresses accepted). Browser authorization stays public.
+`ID_TRUSTED_NETWORK` — one IPv4 CIDR naming the network the platform's
+servers sit on (`/32` and bare addresses accepted; a comma-separated list
+is still parsed for servers that straddle two ranges, and the pre-rollout
+name `ID_TRUSTED_APP_CIDRS` is still honoured). It describes a *network*,
+not an application. Browser authorization stays public.
 
 Resolution rules, applied deterministically:
 
@@ -76,7 +79,7 @@ Resolution rules, applied deterministically:
 - Denials are a generic `403 { "error": "Forbidden", "correlationId" }`;
   the log line carrying that correlation id records the resolved peer IP.
 - In production, startup **fails** when `ID_APP_AUTH_MODE` needs CIDRs and
-  `ID_TRUSTED_APP_CIDRS` is empty, and when any CIDR entry is malformed.
+  `ID_TRUSTED_NETWORK` is empty, and when any CIDR entry is malformed.
 
 `ID_APP_AUTH_MODE` is the rollout flag: `cidr` (POC default), `secret`
 (legacy `ID_CLIENT_SECRET` only), or `dual` (either accepted) for the
@@ -172,18 +175,26 @@ user entered straight from the portal.
 ## Configuration
 
 **Zero-config is the intended path.** A fresh instance is expected at
-`identity.X.TLD` and works out of the box: the `.env` carries only
-bootstrap plumbing (MySQL and NocoDB coordinates — see `.env.example`), the
-settings table is created empty on first boot, and the setup wizard fills
-in where this service lives from the URL the first admin actually opens it
-on. `identity.X.TLD` is the one assumption the code makes; nothing else
-about a deployment is defaulted anywhere in the source.
+`identity.X.TLD` and works out of the box. The `.env` carries three things
+and nothing else (see `.env.example`):
 
-Every application-level setting lives in the **`oAuthConfig` table** (base
-`id`) in NocoDB at `nocodb.X.TLD`:
+| Variable | Why it cannot live in the settings table |
+| --- | --- |
+| `NOCODB_BASE_URL` | Where the settings table is |
+| `NOCODB_API_TOKEN` | How to read it |
+| `ID_TRUSTED_NETWORK` | Which network is trusted — a security boundary, not a setting an admin edits through a web page |
+
+Everything else — **the MySQL coordinates included** — is a row in the
+**`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`, so a
+deployment is described in one place rather than split between a file on a
+host and a table. The settings table is created empty on first boot, and
+the setup wizard fills in where this service lives from the URL the first
+admin actually opens it on. `identity.X.TLD` is the one assumption the code
+makes; nothing else about a deployment is defaulted anywhere in the source.
 
 | Key | Purpose |
 | --- | --- |
+| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | The MySQL id_db this app owns and migrates itself. Required — set them here (or in the environment) before first run; a change takes a restart |
 | `PARENT_DOMAIN` | Apex domain (`X.TLD`) the **apps** are served from; drives the cookie scope and redirect allowlist, and is the default super-admin domain |
 | `APP_BASE_URL` | Public base URL of this app, e.g. `https://identity.X.TLD`. Normally left to the wizard — see *Where this service thinks it lives* below |
 | `ID_CLIENT_SECRET` | **Legacy (rollout only)** — shared secret apps present at `/api/token` when `ID_APP_AUTH_MODE` is `secret`/`dual`; ignored in the default `cidr` mode |
@@ -240,9 +251,11 @@ While no OAuth provider is configured, the instance is **unclaimed**: `/`
 redirects to `/setup`, a built-in wizard that walks the first admin through
 claiming it:
 
-1. It checks the NocoDB settings store first — if `NOCODB_API_TOKEN` (or
-   `NOCODB_BASE_URL`) is missing or wrong, the wizard says exactly that:
-   those two must be set in the environment before anything can be saved.
+1. It checks both stores first and names the one that is missing: if
+   `NOCODB_API_TOKEN` or `NOCODB_BASE_URL` is missing or wrong, those two
+   must be set in the environment before anything can be saved; if the
+   `DB_*` rows are unset or MySQL will not answer, the claim has nowhere to
+   record its first user. No form is shown until both answer.
 2. The wizard fills in this service's public URL from the browser's own
    address bar and the application domain from that host minus its label
    (`identity.wisp.net` → `wisp.net`) — both editable, neither guessed
@@ -462,6 +475,15 @@ applications (e.g. Aida UID mappings in NocoDB), never as columns here.
 - `id_tbl_DirectoryKey` — directory-ensure idempotency keys
 - `id_tbl_Migration` — applied-migration history
 
+**Where its coordinates come from.** `DB_HOST` / `DB_PORT` / `DB_USER` /
+`DB_PASSWORD` / `DB_NAME` are settings like any other — rows in
+`oAuthConfig`, or environment overrides — so a deployment is described in
+one place. The pool connects lazily on first use, which makes "not filled
+in yet" an ordinary first-run state rather than a crash: the app still
+listens, `/setup` says which of the two stores is missing, and the schema is
+applied as soon as the coordinates work. A change of coordinates takes a
+restart.
+
 ### Migrations
 
 The schema is applied at boot by `src/migrations.ts`: an ordered,
@@ -476,8 +498,9 @@ users keep their `iUserId` and keep authenticating.
 To change the schema, append a new named migration; never edit, rename, or
 reorder a released one.
 
-**Local vs production.** `docker-compose.yml` / `.env.example` describe a
-disposable local MySQL for development and tests. Production is the shared
+**Local vs production.** `docker-compose.yml` / `.env.example` show how to
+point a dev instance at a disposable local MySQL (export `DB_HOST` and
+friends, or fill the rows in NocoDB once). Production is the shared
 `id_db` on LSAidaOffice01 (`DB_HOST` pointing at that MySQL) — treat it as
 live data at all times.
 

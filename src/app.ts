@@ -3,7 +3,7 @@ import path from 'path';
 import pinoHttp from 'pino-http';
 import pino from 'pino';
 import { loadConfig } from './config';
-import { getDb } from './db';
+import { getDb, dbCoordinates } from './db';
 import { SettingsStore, Settings } from './settings';
 import {
   PROVIDERS,
@@ -52,9 +52,13 @@ const publicDir = path.join(__dirname, '..', 'public');
 
 export function buildApp() {
   const config = loadConfig();
-  const db = getDb(config);
   const settingsStore = new SettingsStore(config);
   const logger = pino({ level: config.LOG_LEVEL });
+  // The MySQL coordinates are settings too, so the pool cannot be built
+  // until the store has been read — it connects on first use instead.
+  // getSettings() rather than the store directly, so an environment-pinned
+  // database still connects while NocoDB is down.
+  const db = getDb(async () => dbCoordinates(await getSettings()));
   const app = express();
 
   app.use(express.json({ limit: '256kb' }));
@@ -104,6 +108,40 @@ export function buildApp() {
     return identityBaseUrl(settings.PARENT_DOMAIN ?? '');
   }
 
+  /**
+   * Is id_db usable? The coordinates are settings, so "not configured yet"
+   * is an ordinary first-run state rather than a crash — and the wizard has
+   * to be able to say which of the two stores is missing.
+   */
+  async function probeDatabase(): Promise<{
+    state: 'ok' | 'unconfigured' | 'unreachable';
+    hint?: string;
+  }> {
+    const settings = await getSettings();
+    if (!dbCoordinates(settings)) {
+      return {
+        state: 'unconfigured',
+        hint:
+          'The id_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME ' +
+          `(and DB_PASSWORD) in the ${config.NOCODB_TABLE_NAME} table in NocoDB, ` +
+          "or set them in this app's environment, then restart.",
+      };
+    }
+    try {
+      await db.query('SELECT 1');
+      return { state: 'ok' };
+    } catch (err) {
+      logger.error({ err }, '[db] probe failed');
+      return {
+        state: 'unreachable',
+        hint:
+          `MySQL at ${settings.DB_HOST} did not accept the connection. Check the ` +
+          'DB_* settings (host, port, user, password, database) and that this ' +
+          'host may reach it.',
+      };
+    }
+  }
+
   async function resolveSession(req: express.Request): Promise<store.SessionRow | null> {
     const id = getCookie(req, SESSION_COOKIE);
     if (!id) return null;
@@ -118,7 +156,7 @@ export function buildApp() {
   // apps sharing an allowed egress IP can call the same endpoints, which is
   // accepted for the first-party POC on a controlled host. ID_APP_AUTH_MODE
   // keeps the legacy ID_CLIENT_SECRET check available during rollout.
-  const appCidrs = parseCidrList(config.ID_TRUSTED_APP_CIDRS);
+  const appCidrs = parseCidrList(config.ID_TRUSTED_NETWORK);
   const proxyCidrs = parseCidrList(config.ID_TRUSTED_PROXY_CIDRS);
 
   /** True when the request's resolved IPv4 peer is inside the app allowlist. */
@@ -353,6 +391,10 @@ export function buildApp() {
       }
     }
 
+    // The identity data has to be writable before anyone can claim the
+    // instance — the claimer becomes the first row in id_tbl_User.
+    const database = await probeDatabase();
+
     // A claim already in flight: enough to rebuild the request without
     // making the admin retype anything. Never the client secret — the server
     // reuses the one held in the cookie.
@@ -377,6 +419,8 @@ export function buildApp() {
       unclaimed: isUnclaimed(settings),
       nocodb,
       nocodbHint,
+      database: database.state,
+      databaseHint: database.hint,
       pending,
       pinned: {
         appBaseUrl: normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true }) ?? '',
@@ -468,6 +512,11 @@ export function buildApp() {
         return res.status(503).json({
           error: `NocoDB at ${config.NOCODB_BASE_URL} is unreachable or rejected the token — fix the environment first.`,
         });
+      }
+
+      const database = await probeDatabase();
+      if (database.state !== 'ok') {
+        return res.status(503).json({ error: database.hint });
       }
 
       const body = (req.body ?? {}) as Record<string, string>;
@@ -916,7 +965,7 @@ export function buildApp() {
    *
    * The application proves the code was addressed to it (redirect_uri must
    * match what the code was minted for) and that it is one of ours: in the
-   * POC its server's IPv4 peer is inside ID_TRUSTED_APP_CIDRS (the legacy
+   * POC its server's IPv4 peer is inside ID_TRUSTED_NETWORK (the legacy
    * ID_CLIENT_SECRET check remains available via ID_APP_AUTH_MODE during
    * rollout). Codes are single-use and expire in 5 minutes.
    *

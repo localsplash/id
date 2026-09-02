@@ -55,6 +55,23 @@ export const KNOWN_SETTINGS: SettingDef[] = [
       'wizard writes exactly that, so it normally never has to be typed.',
   },
   {
+    key: 'DB_HOST',
+    description:
+      'Hostname of the MySQL server holding id_db, the shared platform identity ' +
+      'database this app owns and migrates itself. Required — the app has no ' +
+      'sessions, users or identities until it is set. A change takes a restart.',
+  },
+  {
+    key: 'DB_PORT',
+    description: "MySQL port. Empty means MySQL's own default, 3306.",
+  },
+  { key: 'DB_USER', description: 'MySQL user for id_db. Required.' },
+  { key: 'DB_PASSWORD', description: 'Password for DB_USER.' },
+  {
+    key: 'DB_NAME',
+    description: 'Database name, conventionally id_db. Required.',
+  },
+  {
     key: 'ID_CLIENT_SECRET',
     description:
       'LEGACY (rollout only). Shared secret applications present at POST /api/token ' +

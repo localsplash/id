@@ -6,6 +6,7 @@ import {
   settingOverridesFromEnv,
 } from './settings';
 import type { AppConfig } from './config';
+import { dbCoordinates } from './db';
 
 /**
  * The settings precedence rule: the environment overrides the store, the
@@ -145,5 +146,41 @@ describe('SettingsStore precedence', () => {
     expect(byKey.PARENT_DOMAIN).toMatchObject({ value: 'wisp.net', source: 'store' });
     // In force without a row of its own — still visible rather than silent.
     expect(byKey.GOOGLE_CLIENT_ID).toMatchObject({ value: 'gid', source: 'environment' });
+  });
+});
+
+describe('database coordinates as settings', () => {
+  it('reads the pool coordinates out of the settings', () => {
+    expect(
+      dbCoordinates({
+        DB_HOST: 'mysql.internal',
+        DB_PORT: '13306',
+        DB_USER: 'id_app',
+        DB_PASSWORD: 'pw',
+        DB_NAME: 'id_db',
+      })
+    ).toEqual({
+      host: 'mysql.internal',
+      port: 13306,
+      user: 'id_app',
+      password: 'pw',
+      database: 'id_db',
+    });
+  });
+
+  it("falls back to MySQL's own port, and to no password", () => {
+    expect(dbCoordinates({ DB_HOST: 'mysql.internal', DB_USER: 'id_app', DB_NAME: 'id_db' })).toEqual({
+      host: 'mysql.internal',
+      port: 3306,
+      user: 'id_app',
+      password: '',
+      database: 'id_db',
+    });
+  });
+
+  it('invents nothing when the deployment has not said where the database is', () => {
+    expect(dbCoordinates({})).toBeNull();
+    expect(dbCoordinates({ DB_HOST: 'mysql.internal' })).toBeNull();
+    expect(dbCoordinates({ DB_HOST: 'mysql.internal', DB_USER: 'id_app' })).toBeNull();
   });
 });

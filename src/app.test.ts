@@ -27,6 +27,8 @@ const fake = {
   settings: {} as Record<string, string>,
   /** Keys the environment pins — they win over `settings` and cannot be written. */
   overrides: {} as Record<string, string>,
+  /** State of id_db as the wizard's probe would find it. */
+  db: 'ok' as 'ok' | 'unconfigured' | 'unreachable',
   sessions: new Map<string, FakeSession>(),
   authCodes: new Map<
     string,
@@ -40,6 +42,7 @@ const fake = {
 function resetFakes() {
   fake.settings = { PARENT_DOMAIN: 'wisp.net' };
   fake.overrides = {};
+  fake.db = 'ok';
   fake.sessions.clear();
   fake.authCodes.clear();
   fake.users.clear();
@@ -47,7 +50,21 @@ function resetFakes() {
   fake.events = [];
 }
 
-vi.mock('./db', () => ({ getDb: () => ({}) }));
+vi.mock('./db', () => ({
+  getDb: () => ({
+    async query() {
+      if (fake.db === 'unreachable') throw new Error('ECONNREFUSED');
+      return [[{ 1: 1 }], []];
+    },
+  }),
+  // The real one reads DB_HOST/DB_USER/DB_NAME out of the settings, so
+  // "unconfigured" is what a fresh install looks like before anyone fills
+  // the rows in.
+  dbCoordinates: () =>
+    fake.db === 'unconfigured'
+      ? null
+      : { host: 'db.test', port: 3306, user: 'id', password: '', database: 'id_db' },
+}));
 
 vi.mock('./settings', () => {
   class SettingsStore {
@@ -185,6 +202,7 @@ import { buildApp } from './app';
 
 const ENV_KEYS = [
   'ID_APP_AUTH_MODE',
+  'ID_TRUSTED_NETWORK',
   'ID_TRUSTED_APP_CIDRS',
   'ID_TRUSTED_PROXY_CIDRS',
   'NODE_ENV',
@@ -599,5 +617,72 @@ describe('/admin config and the environment', () => {
     expect(res.status).toBe(409);
     expect(res.body.error).toContain('environment');
     expect(fake.settings.APP_BASE_URL).toBeUndefined();
+  });
+});
+
+// ── The .env carries three things; the rest is settings ──────────────────────
+
+describe('trusted network', () => {
+  it('is one CIDR value under ID_TRUSTED_NETWORK', async () => {
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    expect((await request(app).get('/api/events?since=0')).status).toBe(200);
+
+    const elsewhere = makeApp({ ID_TRUSTED_NETWORK: ELSEWHERE });
+    expect((await request(elsewhere).get('/api/events?since=0')).status).toBe(403);
+  });
+
+  it('still honours the pre-rollout ID_TRUSTED_APP_CIDRS name', async () => {
+    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    expect((await request(app).get('/api/events?since=0')).status).toBe(200);
+  });
+
+  it('prefers the new name when a deployment sets both', async () => {
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK, ID_TRUSTED_APP_CIDRS: ELSEWHERE });
+    expect((await request(app).get('/api/events?since=0')).status).toBe(200);
+  });
+});
+
+/**
+ * The identity database is a setting like any other, so "not filled in yet"
+ * is an ordinary first-run state: the app answers, and the wizard says which
+ * store is missing instead of failing at the moment of the claim.
+ */
+describe('id_db as a setting', () => {
+  const CREDENTIALS = { provider: 'google', clientId: 'gid', clientSecret: 'gsecret' };
+
+  it('tells the wizard the database is not configured yet', async () => {
+    fake.db = 'unconfigured';
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const res = await request(app).get('/api/setup/status');
+    expect(res.status).toBe(200);
+    expect(res.body.database).toBe('unconfigured');
+    expect(res.body.databaseHint).toContain('DB_HOST');
+  });
+
+  it('reports an unreachable database separately from an unset one', async () => {
+    fake.db = 'unreachable';
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const res = await request(app).get('/api/setup/status');
+    expect(res.body.database).toBe('unreachable');
+  });
+
+  it('refuses to start a claim it could not record', async () => {
+    fake.db = 'unconfigured';
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const res = await request(app)
+      .post('/api/setup/start')
+      .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net', ...CREDENTIALS });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toContain('DB_HOST');
+  });
+
+  it('proceeds once both stores answer', async () => {
+    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const status = await request(app).get('/api/setup/status');
+    expect(status.body.database).toBe('ok');
+    const res = await request(app)
+      .post('/api/setup/start')
+      .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net', ...CREDENTIALS });
+    expect(res.status).toBe(200);
   });
 });
