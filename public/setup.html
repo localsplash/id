@@ -65,6 +65,17 @@
       </p>
 
       <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">This service's public URL</label>
+        <input id="appBaseUrl" type="text" required
+          class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        <p id="appBaseUrlHint" class="text-[11px] text-slate-400 mt-1">
+          Taken from the address you opened this page on. Change it only if
+          people will reach this service on a different URL than you did — it
+          is what the OAuth postbacks below are built from.
+        </p>
+      </div>
+
+      <div>
         <label class="block text-xs font-medium text-slate-500 mb-1">Application domain (X.TLD) — where the apps are served</label>
         <input id="parentDomain" type="text" placeholder="example.com" required
           class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
@@ -169,13 +180,26 @@
     }
     if (q.get('error') && errorMap[q.get('error')]) showError(errorMap[q.get('error')]);
 
-    let CALLBACKS = { google: '', microsoft: '' };
-    let APP_BASE = '';
+    // Where this service lives is not configuration to be guessed — it is the
+    // address in the browser's own bar. The URL that got you here is the URL
+    // that has to work, so it is the default for everything derived from it.
+    // The one convention assumed anywhere is identity.X.TLD: the parent
+    // domain is this host minus its own label.
+    const BROWSER_BASE_URL = location.origin;
+
+    function parentDomainFromHost(host) {
+      const labels = String(host || '').toLowerCase().split('.');
+      return labels.length > 2 ? labels.slice(1).join('.') : host;
+    }
+
+    function appBaseUrl() {
+      return document.getElementById('appBaseUrl').value.trim().replace(/\/+$/, '');
+    }
 
     const CONSOLE_HINTS = {
       google: () =>
         'Google Cloud Console → APIs & Services → Credentials → your OAuth 2.0 Client ID → ' +
-        `"Authorized redirect URIs". Also add ${APP_BASE || 'the app base URL'} under ` +
+        `"Authorized redirect URIs". Also add ${appBaseUrl() || 'the service URL above'} under ` +
         '"Authorized JavaScript origins".',
       microsoft: () =>
         'Microsoft Entra admin center → App registrations → your app → Authentication → ' +
@@ -187,13 +211,15 @@
     }
     function refreshProviderUi() {
       const p = currentProvider();
+      const base = appBaseUrl();
       document.getElementById('tenantRow').classList.toggle('hidden', p !== 'microsoft');
-      document.getElementById('callbackUrl').textContent = CALLBACKS[p] || '';
+      document.getElementById('callbackUrl').textContent = base ? `${base}/auth/${p}/callback` : '';
       document.getElementById('callbackHint').textContent = CONSOLE_HINTS[p] ? CONSOLE_HINTS[p]() : '';
     }
     document.querySelectorAll('input[name="provider"]').forEach((r) =>
       r.addEventListener('change', refreshProviderUi)
     );
+    document.getElementById('appBaseUrl').addEventListener('input', refreshProviderUi);
 
     async function start(body) {
       const r = await fetch('/api/setup/start', {
@@ -242,6 +268,7 @@
         start({
           parentDomain: pending.parentDomain,
           adminDomain: document.getElementById('confirmDomain').value.trim(),
+          appBaseUrl: BROWSER_BASE_URL,
           provider: pending.provider,
           clientId: pending.clientId,
           tenant: pending.tenant,
@@ -263,14 +290,30 @@
           block.classList.remove('hidden');
           return; // no form until settings can actually be saved
         }
-        CALLBACKS = s.callbackUrls;
-        APP_BASE = s.suggested.appBaseUrl || '';
-
         if (q.get('error') === 'domain_mismatch' && renderConfirm(s.pending)) return;
 
         const p = s.pending;
-        document.getElementById('parentDomain').value =
-          (p && p.parentDomain) || s.suggested.parentDomain || '';
+        const pinned = s.pinned || {};
+        const locked = s.locked || {};
+
+        // Anything already pinned (an environment override, or a row someone
+        // put in the settings store) wins; otherwise this page's own URL.
+        const baseInput = document.getElementById('appBaseUrl');
+        baseInput.value = pinned.appBaseUrl || BROWSER_BASE_URL;
+        if (locked.appBaseUrl) {
+          baseInput.readOnly = true;
+          baseInput.className += ' bg-slate-50 text-slate-500';
+          document.getElementById('appBaseUrlHint').textContent =
+            "APP_BASE_URL is set in this app's environment, so it is fixed here.";
+        }
+
+        const domainInput = document.getElementById('parentDomain');
+        domainInput.value =
+          (p && p.parentDomain) || pinned.parentDomain || parentDomainFromHost(location.hostname);
+        if (locked.parentDomain) {
+          domainInput.readOnly = true;
+          domainInput.className += ' bg-slate-50 text-slate-500';
+        }
         if (p) {
           document.getElementById('clientId').value = p.clientId || '';
           document.getElementById('tenant').value = p.tenant || '';
@@ -294,6 +337,7 @@
       start({
         parentDomain: document.getElementById('parentDomain').value.trim(),
         adminDomain: document.getElementById('adminDomain').value.trim(),
+        appBaseUrl: appBaseUrl(),
         provider: currentProvider(),
         clientId: document.getElementById('clientId').value.trim(),
         clientSecret: document.getElementById('clientSecret').value.trim(),

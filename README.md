@@ -2,14 +2,14 @@
 
 `id` is the single sign-in surface for every application under one parent
 domain (`X.TLD`). Applications never talk to Google, Microsoft, or the UISP
-bridge themselves — they redirect the browser to `id.X.TLD`, and `id` hands
+bridge themselves — they redirect the browser to `identity.X.TLD`, and `id` hands
 back a one-time code that resolves to the signed-in identity.
 
 ```
- ┌────────────┐  1. no session → 302   ┌────────────┐
- │ echo.X.TLD │ ─────────────────────▶ │  id.X.TLD  │──▶ Google / Microsoft /
- │ aida.X.TLD │                        │            │◀── UISP bridge plugin
- └────────────┘ ◀───────────────────── └────────────┘
+ ┌────────────┐  1. no session → 302   ┌──────────────────┐
+ │ echo.X.TLD │ ─────────────────────▶ │ identity.X.TLD   │──▶ Google / Microsoft /
+ │ aida.X.TLD │                        │                  │◀── UISP bridge plugin
+ └────────────┘ ◀───────────────────── └──────────────────┘
        │         2. 302 back with            │
        │            one-time ?code           │ SSO cookie on .X.TLD
        │                                     ▼
@@ -21,7 +21,7 @@ back a one-time code that resolves to the signed-in identity.
 **Application login.** An app with no local session sends the browser to
 
 ```
-GET https://id.X.TLD/authorize?redirect_uri=https://app.X.TLD/auth/callback&state=<opaque>
+GET https://identity.X.TLD/authorize?redirect_uri=https://app.X.TLD/auth/callback&state=<opaque>
 ```
 
 `redirect_uri` must be an https URL whose host is the parent domain or any
@@ -34,7 +34,7 @@ is shown and the round trip completes after the user authenticates.
 The app then redeems the code server-to-server:
 
 ```
-POST https://id.X.TLD/api/token
+POST https://identity.X.TLD/api/token
 { "code": "…", "redirect_uri": "https://app.X.TLD/auth/callback" }
 
 → { "user": { "iUserId", "email", "displayName", "superAdmin" },
@@ -171,14 +171,21 @@ user entered straight from the portal.
 
 ## Configuration
 
-The `.env` carries **only** bootstrap plumbing: MySQL and NocoDB
-coordinates (see `.env.example`). Every application-level setting lives in
-the **`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`:
+**Zero-config is the intended path.** A fresh instance is expected at
+`identity.X.TLD` and works out of the box: the `.env` carries only
+bootstrap plumbing (MySQL and NocoDB coordinates — see `.env.example`), the
+settings table is created empty on first boot, and the setup wizard fills
+in where this service lives from the URL the first admin actually opens it
+on. `identity.X.TLD` is the one assumption the code makes; nothing else
+about a deployment is defaulted anywhere in the source.
+
+Every application-level setting lives in the **`oAuthConfig` table** (base
+`id`) in NocoDB at `nocodb.X.TLD`:
 
 | Key | Purpose |
 | --- | --- |
 | `PARENT_DOMAIN` | Apex domain (`X.TLD`) the **apps** are served from; drives the cookie scope and redirect allowlist, and is the default super-admin domain |
-| `APP_BASE_URL` | Public base URL of this app, e.g. `https://id.X.TLD` |
+| `APP_BASE_URL` | Public base URL of this app, e.g. `https://identity.X.TLD`. Normally left to the wizard — see *Where this service thinks it lives* below |
 | `ID_CLIENT_SECRET` | **Legacy (rollout only)** — shared secret apps present at `/api/token` when `ID_APP_AUTH_MODE` is `secret`/`dual`; ignored in the default `cidr` mode |
 | `SUPERADMIN_DOMAIN` | Domain(s) the **identity provider vouches for** whose users are Super System Admins — comma-separated list accepted (default: `PARENT_DOMAIN`) |
 | `DEFAULT_REDIRECT_URI` | Where an unsolicited sign-in (e.g. from the ISP portal) lands |
@@ -187,12 +194,45 @@ the **`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`:
 | `UISP_SSO_SECRET` / `UISP_PLUGIN_URL` / `UISP_BASE_URL` / `UISP_CRM_APP_KEY_READ` | UISP bridge & CRM |
 
 On first boot `id` creates the base/table and seeds every known key with an
-empty value and a description, so the menu of settings is visible without
-guessing. **A login method is only offered when all of its required keys are
-set** — an unconfigured provider simply does not appear on the login page.
+**empty** value and a description, so the menu of settings is visible
+without guessing. Seeded rows stay empty on purpose: a database being
+created for the first time is not where a public URL or a domain gets
+invented. **A login method is only offered when all of its required keys
+are set** — an unconfigured provider simply does not appear on the login
+page.
 
 Settings are re-read at most every 30 seconds; changes in NocoDB take
 effect without a restart.
+
+### Environment overrides
+
+Any key in the table above may also be set in the **environment**, where it
+wins over the stored row. That is the escape hatch for deployments that
+manage configuration as environment (a Helm chart, a CI secret) or that
+need an instance up before NocoDB exists at all — it is an override, not a
+default, and the zero-config path leaves all of it unset.
+
+An overridden key is read-only in `/admin` (tagged `env`, with a `409` on
+any attempt to write it) and is never copied into the store, since a copy
+would go stale the moment the environment changed. Blank counts as unset,
+so an empty variable in a compose file does not shadow the store.
+
+### Where this service thinks it lives
+
+`APP_BASE_URL` is what the OAuth callback URIs are built from, and it is
+resolved per request in this order:
+
+1. the environment override, if there is one;
+2. the `APP_BASE_URL` row in `oAuthConfig` — what the setup wizard wrote;
+3. the URL the browser actually reached this service on (honouring
+   `X-Forwarded-Proto` / `X-Forwarded-Host` from a reverse proxy);
+4. `https://identity.<PARENT_DOMAIN>` — the naming convention, for the rare
+   call with no request to observe.
+
+Leave 1 and 2 unset and the service is simply correct about itself: it is
+reachable at exactly the URL that reached it. `PARENT_DOMAIN` follows the
+same convention in the wizard — this host minus its own label, so
+`identity.wisp.net` proposes `wisp.net`.
 
 ### First-run setup wizard
 
@@ -203,10 +243,15 @@ claiming it:
 1. It checks the NocoDB settings store first — if `NOCODB_API_TOKEN` (or
    `NOCODB_BASE_URL`) is missing or wrong, the wizard says exactly that:
    those two must be set in the environment before anything can be saved.
-2. The admin enters the application domain (`X.TLD`) and credentials for
-   **Google or Microsoft** (the wizard is limited to providers that can
-   prove a domain; Microsoft additionally requires a tenant ID — `common`
-   cannot prove anything). A Super Admin domain can be given too, but it is
+2. The wizard fills in this service's public URL from the browser's own
+   address bar and the application domain from that host minus its label
+   (`identity.wisp.net` → `wisp.net`) — both editable, neither guessed
+   server-side, and both fixed and read-only when the environment pins
+   them. The admin confirms the application domain (`X.TLD`) and enters
+   credentials for **Google or Microsoft** (the wizard is limited to
+   providers that can prove a domain; Microsoft additionally requires a
+   tenant ID — `common` cannot prove anything). In production the service
+   URL must be on the domain being claimed. A Super Admin domain can be given too, but it is
    optional — see below.
 3. The credentials are held in a short-lived cookie — *not* saved — while a
    real OAuth round trip runs against them.

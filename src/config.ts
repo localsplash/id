@@ -9,6 +9,19 @@ import { z } from 'zod';
  * NocoDB `oAuthConfig` table (see settings.ts) so it can be changed at
  * runtime without redeploying, and so every app under the parent domain
  * reads the same values.
+ *
+ * Those settings are not listed in the schema below, but any of them may
+ * still be set in the environment: `settingOverridesFromEnv()` in
+ * settings.ts reads every KNOWN_SETTINGS key straight from process.env and
+ * gives it precedence over the store. That is an override for deployments
+ * that pin configuration, not a default — nothing here invents a value for
+ * a setting the deployment has not stated.
+ *
+ * APP_BASE_URL in particular needs no answer here or in the store: left
+ * unset, the public base URL is the URL the browser actually reached this
+ * service on (app.ts), and the setup wizard persists exactly that. The one
+ * assumption the code makes about it is the naming convention
+ * identity.X.TLD (web.ts).
  */
 const envSchema = z.object({
   NODE_ENV: z.string().default('development'),

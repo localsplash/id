@@ -36,6 +36,13 @@ async function main() {
   try {
     await settingsStore.bootstrap();
     console.log('[settings] oAuthConfig table ready');
+    // Seeded rows are empty on purpose: a table being created for the first
+    // time is not where a public URL or a domain gets invented. The setup
+    // wizard fills those in from the URL the first admin arrives on.
+    const pinned = settingsStore.overriddenKeys();
+    if (pinned.length) {
+      console.log(`[settings] overridden by the environment: ${pinned.join(', ')}`);
+    }
   } catch (err) {
     console.warn(`[settings] NocoDB bootstrap failed (will retry on demand): ${String(err)}`);
   }

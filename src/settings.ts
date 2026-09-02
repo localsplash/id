@@ -1,7 +1,8 @@
 import { AppConfig } from './config';
 
 /**
- * Settings live in NocoDB, not in the environment.
+ * Settings live in NocoDB, not in the environment — with the environment
+ * kept as an override for deployments that need to pin a value.
  *
  * The `oAuthConfig` table (base `id` by default) is a plain key/value store
  * that a Super System Admin can edit either through NocoDB itself at
@@ -10,11 +11,24 @@ import { AppConfig } from './config';
  * one set of credentials serves echo.X.TLD, aida.X.TLD, and whatever comes
  * next.
  *
- * On boot the table is created and seeded with every known key (empty
- * values) if it does not exist yet, so the admin sees the full menu of
- * settings rather than having to guess key names. Unknown keys are kept —
- * new applications may store their own settings here without this app
- * needing to learn about them.
+ * Resolution order for every key below:
+ *
+ *   1. the process environment (`.env`) — an explicit override. A key set
+ *      there wins over the store, is not writable from /admin, and is never
+ *      copied into the store (it would go stale the moment the env changed).
+ *   2. the `oAuthConfig` row — where the setup wizard and /admin write.
+ *   3. nothing. There is deliberately no third place: a value that can be
+ *      observed rather than configured (APP_BASE_URL, PARENT_DOMAIN) is
+ *      derived from the URL the browser actually used to reach this service,
+ *      at the point of use — see web.ts. The only assumption this codebase
+ *      makes about that URL is the naming convention identity.X.TLD.
+ *
+ * On boot the table is created and seeded with every known key if it does
+ * not exist yet, so the admin sees the full menu of settings rather than
+ * having to guess key names. Seeded rows are left EMPTY on purpose — no
+ * value is invented for a database that is still being created. Unknown
+ * keys are kept — new applications may store their own settings here
+ * without this app needing to learn about them.
  */
 
 export interface SettingDef {
@@ -35,8 +49,10 @@ export const KNOWN_SETTINGS: SettingDef[] = [
   {
     key: 'APP_BASE_URL',
     description:
-      'Public base URL of this identity app, e.g. https://id.wisp.net. Used to build ' +
-      'the OAuth callback URIs registered with each provider.',
+      'Public base URL of this identity app, e.g. https://identity.wisp.net. Used to ' +
+      'build the OAuth callback URIs registered with each provider. Leave it empty ' +
+      'and the URL the browser reached this service on is used instead — the setup ' +
+      'wizard writes exactly that, so it normally never has to be typed.',
   },
   {
     key: 'ID_CLIENT_SECRET',
@@ -97,6 +113,47 @@ export const KNOWN_SETTINGS: SettingDef[] = [
 
 export type Settings = Record<string, string>;
 
+// ─── Environment overrides ────────────────────────────────────────────────────
+
+/**
+ * Any known setting may be pinned in the environment, where it wins over the
+ * store. This is the escape hatch for deployments that manage configuration
+ * as environment (a Helm chart, a CI secret) and for bringing an instance up
+ * before NocoDB exists at all; the zero-config path leaves all of it unset.
+ *
+ * Blank and whitespace-only values are ignored rather than treated as an
+ * override of "" — an empty variable in a compose file means "not set here".
+ */
+export function settingOverridesFromEnv(env: NodeJS.ProcessEnv = process.env): Settings {
+  const overrides: Settings = {};
+  for (const { key } of KNOWN_SETTINGS) {
+    const raw = env[key];
+    if (typeof raw === 'string' && raw.trim() !== '') overrides[key] = raw.trim();
+  }
+  return overrides;
+}
+
+/** Raised when a write targets a key the environment has pinned. */
+export class SettingOverriddenError extends Error {
+  constructor(public key: string) {
+    super(
+      `${key} is set in this app's environment, which overrides the settings ` +
+        'store. Change it there (and restart) or unset it to manage it here.'
+    );
+    this.name = 'SettingOverriddenError';
+  }
+}
+
+/** Where an effective value came from — surfaced to /admin and the wizard. */
+export type SettingSource = 'environment' | 'store';
+
+export interface AdminSetting {
+  key: string;
+  value: string;
+  description: string;
+  source: SettingSource;
+}
+
 // ─── NocoDB v2 API client ─────────────────────────────────────────────────────
 
 interface NocoTableRow {
@@ -112,7 +169,20 @@ export class SettingsStore {
   private tableId: string | null = null;
   private cache: { at: number; settings: Settings } | null = null;
 
-  constructor(private config: AppConfig) {}
+  constructor(
+    private config: AppConfig,
+    private overrides: Settings = settingOverridesFromEnv()
+  ) {}
+
+  /** True when the environment pins this key, so the store cannot decide it. */
+  isOverridden(key: string): boolean {
+    return key in this.overrides;
+  }
+
+  /** The keys the environment is pinning, for logging and the admin UI. */
+  overriddenKeys(): string[] {
+    return Object.keys(this.overrides);
+  }
 
   private headers(): Record<string, string> {
     return {
@@ -184,7 +254,12 @@ export class SettingsStore {
     }
     this.tableId = table.id;
 
-    // Seed missing keys (empty values) so the full settings menu is visible.
+    // Seed missing keys so the full settings menu is visible. Values are
+    // left EMPTY — a database being created for the first time is not the
+    // place to invent a public URL or a domain, and an environment override
+    // is not copied in either: it would be a snapshot that goes stale the
+    // moment the environment changes. The setup wizard fills these in from
+    // the URL the first admin actually reached this service on.
     const rows = await this.listRows();
     const present = new Set(rows.map((r) => r.Key));
     const missing = KNOWN_SETTINGS.filter((s) => !present.has(s.key));
@@ -220,7 +295,11 @@ export class SettingsStore {
     return out;
   }
 
-  /** All settings as a map. Cached briefly; empty values are omitted. */
+  /**
+   * All settings as a map, with the environment overriding the store. Cached
+   * briefly; empty values are omitted, so a blank row reads as "not set"
+   * rather than as an empty string that would shadow the override.
+   */
   async getAll(): Promise<Settings> {
     if (this.cache && Date.now() - this.cache.at < CACHE_TTL_MS) return this.cache.settings;
     const rows = await this.listRows();
@@ -230,28 +309,65 @@ export class SettingsStore {
         settings[r.Key] = String(r.Value).trim();
       }
     }
+    Object.assign(settings, this.overrides);
     this.cache = { at: Date.now(), settings };
     return settings;
+  }
+
+  /**
+   * The effective settings when the store cannot be reached at all — the
+   * environment alone. Enough for an instance whose configuration is pinned
+   * to keep working while NocoDB is down or not yet installed.
+   */
+  fromEnvOnly(): Settings {
+    return { ...this.overrides };
   }
 
   async get(key: string): Promise<string | undefined> {
     return (await this.getAll())[key];
   }
 
-  /** Rows including empty values and descriptions — for the admin UI. */
-  async listForAdmin(): Promise<Array<{ key: string; value: string; description: string }>> {
+  /**
+   * Rows including empty values and descriptions — for the admin UI. The
+   * effective value is reported, so a key the environment pins shows what is
+   * actually in force (tagged 'environment', and not editable) rather than
+   * the store row it is shadowing.
+   */
+  async listForAdmin(): Promise<AdminSetting[]> {
     const rows = await this.listRows();
-    return rows
+    const described = new Map(KNOWN_SETTINGS.map((s) => [s.key, s.description]));
+    const items: AdminSetting[] = rows
       .filter((r) => r.Key)
       .map((r) => ({
         key: r.Key,
-        value: r.Value == null ? '' : String(r.Value),
+        value: this.isOverridden(r.Key)
+          ? this.overrides[r.Key]
+          : r.Value == null
+            ? ''
+            : String(r.Value),
         description: r.Description == null ? '' : String(r.Description),
-      }))
-      .sort((a, b) => a.key.localeCompare(b.key));
+        source: this.isOverridden(r.Key) ? ('environment' as const) : ('store' as const),
+      }));
+
+    // An override for a key the store has no row for yet (NocoDB seeded
+    // before the key existed, or bootstrap has not run) is still in force —
+    // show it rather than letting it act invisibly.
+    const present = new Set(items.map((i) => i.key));
+    for (const [key, value] of Object.entries(this.overrides)) {
+      if (present.has(key)) continue;
+      items.push({
+        key,
+        value,
+        description: described.get(key) ?? '',
+        source: 'environment',
+      });
+    }
+    return items.sort((a, b) => a.key.localeCompare(b.key));
   }
 
+  /** Write a key to the store. Refused when the environment pins it. */
   async set(key: string, value: string): Promise<void> {
+    if (this.isOverridden(key)) throw new SettingOverriddenError(key);
     const tableId = await this.resolveTableId();
     const rows = await this.listRows();
     const existing = rows.find((r) => r.Key === key);

@@ -18,6 +18,11 @@ services:
       ID_APP_AUTH_MODE: ${ID_APP_AUTH_MODE:-cidr}
       ID_TRUSTED_APP_CIDRS: ${ID_TRUSTED_APP_CIDRS:-127.0.0.1/32,172.16.0.0/12}
       ID_TRUSTED_PROXY_CIDRS: ${ID_TRUSTED_PROXY_CIDRS:-}
+      # Optional overrides of oAuthConfig rows. Blank counts as unset, so
+      # leaving these alone keeps the zero-config path: the public base URL
+      # is whatever URL the browser reached this service on.
+      APP_BASE_URL: ${APP_BASE_URL:-}
+      PARENT_DOMAIN: ${PARENT_DOMAIN:-}
     ports:
       - "127.0.0.1:3200:3200"
     restart: unless-stopped

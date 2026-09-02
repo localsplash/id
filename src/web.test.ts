@@ -9,6 +9,10 @@ import {
   isValidDomain,
   isValidDomainList,
   secretsMatch,
+  normalizeBaseUrl,
+  identityBaseUrl,
+  isHostUnderDomain,
+  IDENTITY_HOST_LABEL,
 } from './web';
 import {
   availableLoginMethods,
@@ -283,12 +287,61 @@ describe('isTenantLocked', () => {
   });
 });
 
+describe('the identity.X.TLD convention', () => {
+  it('is the only host default in the code', () => {
+    expect(IDENTITY_HOST_LABEL).toBe('identity');
+    expect(identityBaseUrl('wisp.net')).toBe('https://identity.wisp.net');
+    expect(identityBaseUrl('WISP.NET')).toBe('https://identity.wisp.net');
+    expect(identityBaseUrl('.wisp.net')).toBe('https://identity.wisp.net');
+  });
+
+  it('invents nothing without a parent domain', () => {
+    expect(identityBaseUrl('')).toBe('');
+    expect(identityBaseUrl('   ')).toBe('');
+  });
+
+  it('recognises a host under a domain', () => {
+    expect(isHostUnderDomain('identity.wisp.net', 'wisp.net')).toBe(true);
+    expect(isHostUnderDomain('wisp.net', 'wisp.net')).toBe(true);
+    expect(isHostUnderDomain('identity.wisp.net:3200', 'wisp.net')).toBe(true);
+    expect(isHostUnderDomain('IDENTITY.WISP.NET', 'wisp.net')).toBe(true);
+    expect(isHostUnderDomain('evilwisp.net', 'wisp.net')).toBe(false);
+    expect(isHostUnderDomain('wisp.net.evil.com', 'wisp.net')).toBe(false);
+    expect(isHostUnderDomain('localhost', 'wisp.net')).toBe(false);
+    expect(isHostUnderDomain('wisp.net', '')).toBe(false);
+  });
+});
+
+describe('normalizeBaseUrl', () => {
+  it('reduces a URL to its origin', () => {
+    expect(normalizeBaseUrl('https://identity.wisp.net/')).toBe('https://identity.wisp.net');
+    expect(normalizeBaseUrl('  https://identity.wisp.net/setup?x=1#y  ')).toBe(
+      'https://identity.wisp.net'
+    );
+    expect(normalizeBaseUrl('https://identity.wisp.net:8443')).toBe(
+      'https://identity.wisp.net:8443'
+    );
+  });
+
+  it('takes http only when asked, and never credentials or nonsense', () => {
+    expect(normalizeBaseUrl('http://localhost:3200')).toBeNull();
+    expect(normalizeBaseUrl('http://localhost:3200', { allowHttp: true })).toBe(
+      'http://localhost:3200'
+    );
+    expect(normalizeBaseUrl('https://user:pw@identity.wisp.net')).toBeNull();
+    expect(normalizeBaseUrl('javascript:alert(1)', { allowHttp: true })).toBeNull();
+    expect(normalizeBaseUrl('identity.wisp.net')).toBeNull();
+    expect(normalizeBaseUrl('')).toBeNull();
+  });
+});
+
 describe('setup wizard helpers', () => {
-  it('suggests the parent domain by stripping the app label', () => {
+  it('suggests the parent domain by stripping this service\'s own label', () => {
+    expect(suggestParentDomain('identity.wisp.net')).toBe('wisp.net');
     expect(suggestParentDomain('id.wisp.net')).toBe('wisp.net');
     expect(suggestParentDomain('id.dev.localsplash.ai')).toBe('dev.localsplash.ai');
     expect(suggestParentDomain('wisp.net')).toBe('wisp.net');
-    expect(suggestParentDomain('id.wisp.net:3200')).toBe('wisp.net');
+    expect(suggestParentDomain('identity.wisp.net:3200')).toBe('wisp.net');
   });
 
   it('validates domains', () => {
