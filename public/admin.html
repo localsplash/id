@@ -39,9 +39,9 @@
       <div id="callbacks" class="space-y-3"></div>
     </div>
 
-    <!-- oAuthConfig -->
+    <!-- auth_tbl_Settings -->
     <div class="bg-white rounded-2xl shadow p-6 mb-6">
-      <h2 class="text-sm font-semibold text-slate-700 mb-1">oAuthConfig settings</h2>
+      <h2 class="text-sm font-semibold text-slate-700 mb-1">auth_tbl_Settings settings</h2>
       <p class="text-xs text-slate-500 mb-4">
         Stored in NocoDB. A login method appears on the sign-in page only when all
         of its required keys are set. Values marked secret are write-only here.
@@ -68,7 +68,7 @@
       <div id="spec" class="hidden mb-4 rounded-xl bg-slate-50 border border-slate-200 p-4 text-xs text-slate-600 space-y-2">
         <p class="font-semibold text-slate-700">On boot, each app calls:</p>
         <pre class="bg-white rounded-lg p-2 overflow-x-auto">POST /api/apps/register
-{ "client_secret": "&lt;ID_CLIENT_SECRET&gt;",
+{ "client_secret": "&lt;IDENTITY_CLIENT_SECRET&gt;",
   "name": "EchoWeb",
   "webhook_url": "https://app.&lt;parent-domain&gt;/id/events" }
 

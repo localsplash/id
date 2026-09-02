@@ -1,7 +1,7 @@
 {
-  "name": "id",
+  "name": "identity",
   "version": "0.1.0",
-  "description": "OAuth identity processor and redirector for all apps under one parent domain",
+  "description": "OAuth identity processor and redirector for all apps under one parent domain (identity.X.TLD)",
   "main": "dist/server.js",
   "scripts": {
     "test": "vitest run",

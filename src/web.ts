@@ -8,9 +8,9 @@ import { OAuthState } from './providers';
  * kept free of Express state so the logic is unit-testable.
  */
 
-export const SESSION_COOKIE = 'id_sso';
-export const OAUTH_STATE_COOKIE = 'id_oauth_state';
-export const AUTHREQ_COOKIE = 'id_authreq';
+export const SESSION_COOKIE = 'identity_sso';
+export const OAUTH_STATE_COOKIE = 'identity_oauth_state';
+export const AUTHREQ_COOKIE = 'identity_authreq';
 
 // "Forever until revoked": the cookie carries a ten-year Max-Age (a cookie
 // must have some lifetime); validity is decided server-side by dtRevoked.
@@ -221,7 +221,7 @@ export function getAuthRequestFromCookie(req: express.Request): AuthRequest | nu
 
 // ─── First-run setup wizard ──────────────────────────────────────────────────
 
-export const SETUP_COOKIE = 'id_setup';
+export const SETUP_COOKIE = 'identity_setup';
 
 /**
  * The wizard's pending claim: provider credentials the person typed, held in

@@ -45,7 +45,7 @@ export async function findUserByIdentity(
   subject: string
 ): Promise<number | null> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT iUserId FROM id_tbl_Identity WHERE provider = ? AND subject = ?`,
+    `SELECT iUserId FROM identity_tbl_Identity WHERE provider = ? AND subject = ?`,
     [provider, subject]
   );
   return rows.length ? (rows[0].iUserId as number) : null;
@@ -53,7 +53,7 @@ export async function findUserByIdentity(
 
 export async function findUserByEmail(pool: mysql.Pool, email: string): Promise<number | null> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT iUserId FROM id_tbl_User WHERE email = ? LIMIT 1`,
+    `SELECT iUserId FROM identity_tbl_User WHERE email = ? LIMIT 1`,
     [email]
   );
   return rows.length ? (rows[0].iUserId as number) : null;
@@ -61,7 +61,7 @@ export async function findUserByEmail(pool: mysql.Pool, email: string): Promise<
 
 export async function getUser(pool: mysql.Pool, iUserId: number): Promise<UserRow | null> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT iUserId, email, displayName, dtCreated, dtLastLogin FROM id_tbl_User WHERE iUserId = ?`,
+    `SELECT iUserId, email, displayName, dtCreated, dtLastLogin FROM identity_tbl_User WHERE iUserId = ?`,
     [iUserId]
   );
   return rows.length ? (rows[0] as unknown as UserRow) : null;
@@ -73,14 +73,14 @@ export async function createUser(
   displayName: string | null
 ): Promise<number> {
   const [result] = await pool.query<mysql.ResultSetHeader>(
-    `INSERT INTO id_tbl_User (email, displayName) VALUES (?, ?)`,
+    `INSERT INTO identity_tbl_User (email, displayName) VALUES (?, ?)`,
     [email, displayName]
   );
   return result.insertId;
 }
 
 export async function touchLastLogin(pool: mysql.Pool, iUserId: number): Promise<void> {
-  await pool.query(`UPDATE id_tbl_User SET dtLastLogin = NOW(3) WHERE iUserId = ?`, [iUserId]);
+  await pool.query(`UPDATE identity_tbl_User SET dtLastLogin = NOW(3) WHERE iUserId = ?`, [iUserId]);
 }
 
 export async function ensureIdentity(
@@ -93,7 +93,7 @@ export async function ensureIdentity(
   // Refresh the address on re-login so a renamed account doesn't keep its old
   // label, but never overwrite a known one with null.
   await pool.query(
-    `INSERT INTO id_tbl_Identity (iUserId, provider, subject, email)
+    `INSERT INTO identity_tbl_Identity (iUserId, provider, subject, email)
      VALUES (?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE email = COALESCE(VALUES(email), email)`,
     [iUserId, provider, subject, email]
@@ -103,7 +103,7 @@ export async function ensureIdentity(
 export async function listIdentities(pool: mysql.Pool, iUserId: number): Promise<IdentityRow[]> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT iIdentityId, iUserId, provider, subject, email, dtCreated
-       FROM id_tbl_Identity WHERE iUserId = ? ORDER BY dtCreated ASC`,
+       FROM identity_tbl_Identity WHERE iUserId = ? ORDER BY dtCreated ASC`,
     [iUserId]
   );
   return rows as unknown as IdentityRow[];
@@ -115,14 +115,14 @@ export async function getIdentity(
 ): Promise<IdentityRow | null> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT iIdentityId, iUserId, provider, subject, email, dtCreated
-       FROM id_tbl_Identity WHERE iIdentityId = ?`,
+       FROM identity_tbl_Identity WHERE iIdentityId = ?`,
     [iIdentityId]
   );
   return rows.length ? (rows[0] as unknown as IdentityRow) : null;
 }
 
 export async function deleteIdentity(pool: mysql.Pool, iIdentityId: number): Promise<void> {
-  await pool.query(`DELETE FROM id_tbl_Identity WHERE iIdentityId = ?`, [iIdentityId]);
+  await pool.query(`DELETE FROM identity_tbl_Identity WHERE iIdentityId = ?`, [iIdentityId]);
 }
 
 /**
@@ -131,7 +131,7 @@ export async function deleteIdentity(pool: mysql.Pool, iIdentityId: number): Pro
  */
 export async function countIdentities(pool: mysql.Pool, iUserId: number): Promise<number> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT COUNT(*) n FROM id_tbl_Identity WHERE iUserId = ?`,
+    `SELECT COUNT(*) n FROM identity_tbl_Identity WHERE iUserId = ?`,
     [iUserId]
   );
   return Number(rows[0]?.n ?? 0);
@@ -148,7 +148,7 @@ export async function createSession(
 ): Promise<string> {
   const sessionId = generateId(32);
   await pool.query(
-    `INSERT INTO id_tbl_Session (sSessionId, iUserId, bSuperAdmin, sProvider, sSubject)
+    `INSERT INTO identity_tbl_Session (sSessionId, iUserId, bSuperAdmin, sProvider, sSubject)
      VALUES (?, ?, ?, ?, ?)`,
     [sessionId, iUserId, bSuperAdmin ? 1 : 0, provider, subject]
   );
@@ -162,14 +162,14 @@ export async function getSession(
   if (!sessionId || !/^[0-9a-f]{64}$/.test(sessionId)) return null;
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT sSessionId, iUserId, bSuperAdmin, sProvider, sSubject, dtCreated
-       FROM id_tbl_Session WHERE sSessionId = ? AND dtRevoked IS NULL`,
+       FROM identity_tbl_Session WHERE sSessionId = ? AND dtRevoked IS NULL`,
     [sessionId]
   );
   if (!rows.length) return null;
   const r = rows[0];
   // Fire-and-forget activity stamp; a failed write must not fail the request.
   pool
-    .query(`UPDATE id_tbl_Session SET dtLastSeen = NOW(3) WHERE sSessionId = ?`, [sessionId])
+    .query(`UPDATE identity_tbl_Session SET dtLastSeen = NOW(3) WHERE sSessionId = ?`, [sessionId])
     .catch(() => undefined);
   return {
     sSessionId: r.sSessionId as string,
@@ -183,14 +183,14 @@ export async function getSession(
 
 export async function revokeSession(pool: mysql.Pool, sessionId: string): Promise<void> {
   await pool.query(
-    `UPDATE id_tbl_Session SET dtRevoked = NOW(3) WHERE sSessionId = ? AND dtRevoked IS NULL`,
+    `UPDATE identity_tbl_Session SET dtRevoked = NOW(3) WHERE sSessionId = ? AND dtRevoked IS NULL`,
     [sessionId]
   );
 }
 
 export async function revokeAllSessions(pool: mysql.Pool, iUserId: number): Promise<number> {
   const [result] = await pool.query<mysql.ResultSetHeader>(
-    `UPDATE id_tbl_Session SET dtRevoked = NOW(3) WHERE iUserId = ? AND dtRevoked IS NULL`,
+    `UPDATE identity_tbl_Session SET dtRevoked = NOW(3) WHERE iUserId = ? AND dtRevoked IS NULL`,
     [iUserId]
   );
   return result.affectedRows;
@@ -212,7 +212,7 @@ export async function createAuthCode(
 ): Promise<string> {
   const code = generateId(32);
   await pool.query(
-    `INSERT INTO id_tbl_AuthCode
+    `INSERT INTO identity_tbl_AuthCode
        (sCode, iUserId, sRedirectUri, sProvider, sSubject, bSuperAdmin, dtExpires)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
@@ -247,13 +247,13 @@ export async function consumeAuthCode(
 ): Promise<ConsumedAuthCode | null> {
   if (!/^[0-9a-f]{64}$/.test(code)) return null;
   const [result] = await pool.query<mysql.ResultSetHeader>(
-    `UPDATE id_tbl_AuthCode SET dtConsumed = NOW(3)
+    `UPDATE identity_tbl_AuthCode SET dtConsumed = NOW(3)
       WHERE sCode = ? AND sRedirectUri = ? AND dtConsumed IS NULL AND dtExpires > NOW(3)`,
     [code, redirectUri]
   );
   if (result.affectedRows !== 1) return null;
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT iUserId, sProvider, sSubject, bSuperAdmin FROM id_tbl_AuthCode WHERE sCode = ?`,
+    `SELECT iUserId, sProvider, sSubject, bSuperAdmin FROM identity_tbl_AuthCode WHERE sCode = ?`,
     [code]
   );
   if (!rows.length) return null;
@@ -274,7 +274,7 @@ export async function consumeNonce(
   expUnix: number
 ): Promise<boolean> {
   try {
-    await pool.query(`INSERT INTO id_tbl_SsoNonce (sNonce, dtExpires) VALUES (?, ?)`, [
+    await pool.query(`INSERT INTO identity_tbl_SsoNonce (sNonce, dtExpires) VALUES (?, ?)`, [
       nonce,
       toMySQLDateTime(new Date(expUnix * 1000)),
     ]);
@@ -300,10 +300,10 @@ export async function adminListUsers(pool: mysql.Pool): Promise<AdminUserView[]>
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT u.iUserId, u.email, u.displayName, u.dtCreated, u.dtLastLogin,
             i.iIdentityId, i.provider, i.subject, i.email AS identityEmail,
-            (SELECT COUNT(*) FROM id_tbl_Session s
+            (SELECT COUNT(*) FROM identity_tbl_Session s
               WHERE s.iUserId = u.iUserId AND s.dtRevoked IS NULL) AS activeSessions
-       FROM id_tbl_User u
-       LEFT JOIN id_tbl_Identity i ON i.iUserId = u.iUserId
+       FROM identity_tbl_User u
+       LEFT JOIN identity_tbl_Identity i ON i.iUserId = u.iUserId
       ORDER BY u.iUserId, i.provider`
   );
   const users = new Map<number, AdminUserView>();
@@ -357,7 +357,7 @@ export interface AppRow {
  */
 export async function recordAppOrigin(pool: mysql.Pool, origin: string): Promise<void> {
   await pool.query(
-    `INSERT INTO id_tbl_App (sOrigin, dtLastTokenExchange) VALUES (?, NOW(3))
+    `INSERT INTO identity_tbl_App (sOrigin, dtLastTokenExchange) VALUES (?, NOW(3))
      ON DUPLICATE KEY UPDATE dtLastTokenExchange = NOW(3)`,
     [origin]
   );
@@ -374,14 +374,14 @@ export async function registerApp(
   params: { origin: string; name: string | null; webhookUrl: string }
 ): Promise<{ secret: string; rotated: boolean }> {
   const [existing] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT sSecret FROM id_tbl_App WHERE sOrigin = ?`,
+    `SELECT sSecret FROM identity_tbl_App WHERE sOrigin = ?`,
     [params.origin]
   );
   const current = existing.length ? (existing[0].sSecret as string | null) : null;
   const secret = current ?? generateId(32);
 
   await pool.query(
-    `INSERT INTO id_tbl_App (sOrigin, sName, sWebhookUrl, sSecret, dtRegistered)
+    `INSERT INTO identity_tbl_App (sOrigin, sName, sWebhookUrl, sSecret, dtRegistered)
      VALUES (?, ?, ?, ?, NOW(3))
      ON DUPLICATE KEY UPDATE
        sName = VALUES(sName),
@@ -399,14 +399,14 @@ export async function listApps(pool: mysql.Pool): Promise<AppRow[]> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT sOrigin, sName, sWebhookUrl, dtDiscovered, dtRegistered, dtLastTokenExchange,
             dtLastDeliveryOk, dtLastDeliveryFail, sLastError, iConsecutiveFailures
-       FROM id_tbl_App ORDER BY sOrigin`
+       FROM identity_tbl_App ORDER BY sOrigin`
   );
   return rows as unknown as AppRow[];
 }
 
 export async function getAppSecret(pool: mysql.Pool, origin: string): Promise<string | null> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT sSecret FROM id_tbl_App WHERE sOrigin = ?`,
+    `SELECT sSecret FROM identity_tbl_App WHERE sOrigin = ?`,
     [origin]
   );
   return rows.length ? ((rows[0].sSecret as string) ?? null) : null;
@@ -420,7 +420,7 @@ export async function pendingDeliveryCounts(
     `SELECT sOrigin,
             SUM(dtDelivered IS NULL AND dtAbandoned IS NULL) AS pending,
             SUM(dtAbandoned IS NOT NULL) AS abandoned
-       FROM id_tbl_Delivery GROUP BY sOrigin`
+       FROM identity_tbl_Delivery GROUP BY sOrigin`
   );
   const out: Record<string, { pending: number; abandoned: number }> = {};
   for (const r of rows) {
@@ -440,7 +440,7 @@ export async function listEventsSince(
 ): Promise<Array<{ id: number; type: string; occurredAt: string; data: unknown }>> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT iEventId, sType, jsonData, dtCreated
-       FROM id_tbl_Event WHERE iEventId > ? ORDER BY iEventId ASC LIMIT ?`,
+       FROM identity_tbl_Event WHERE iEventId > ? ORDER BY iEventId ASC LIMIT ?`,
     [since, limit]
   );
   return rows.map((r) => ({
@@ -464,8 +464,8 @@ export interface DirectoryUser {
 
 const dirUserSelect = `
   SELECT u.iUserId, u.email, u.displayName,
-         EXISTS(SELECT 1 FROM id_tbl_Identity i WHERE i.iUserId = u.iUserId) AS claimed
-    FROM id_tbl_User u`;
+         EXISTS(SELECT 1 FROM identity_tbl_Identity i WHERE i.iUserId = u.iUserId) AS claimed
+    FROM identity_tbl_User u`;
 
 function toDirectoryUser(r: mysql.RowDataPacket): DirectoryUser {
   return {
@@ -505,7 +505,7 @@ export async function ensureDirectoryUser(
   try {
     if (params.idempotencyKey) {
       const [keyRows] = await conn.query<mysql.RowDataPacket[]>(
-        `${dirUserSelect} JOIN id_tbl_DirectoryKey k ON k.iUserId = u.iUserId
+        `${dirUserSelect} JOIN identity_tbl_DirectoryKey k ON k.iUserId = u.iUserId
           WHERE k.sIdempotencyKey = ?`,
         [params.idempotencyKey]
       );
@@ -529,14 +529,14 @@ export async function ensureDirectoryUser(
         user = toDirectoryUser(existing[0]);
       } else {
         const [ins] = await conn.query<mysql.ResultSetHeader>(
-          `INSERT INTO id_tbl_User (email, displayName) VALUES (?, ?)`,
+          `INSERT INTO identity_tbl_User (email, displayName) VALUES (?, ?)`,
           [email, params.displayName]
         );
         user = { iUserId: ins.insertId, email, displayName: params.displayName, claimed: false };
       }
       if (params.idempotencyKey) {
         await conn.query(
-          `INSERT IGNORE INTO id_tbl_DirectoryKey (sIdempotencyKey, iUserId) VALUES (?, ?)`,
+          `INSERT IGNORE INTO identity_tbl_DirectoryKey (sIdempotencyKey, iUserId) VALUES (?, ?)`,
           [params.idempotencyKey, user.iUserId]
         );
       }
@@ -605,30 +605,30 @@ export async function mergeUsers(
     await conn.beginTransaction();
 
     const [moved] = await conn.query<mysql.ResultSetHeader>(
-      `UPDATE IGNORE id_tbl_Identity SET iUserId = ? WHERE iUserId = ?`,
+      `UPDATE IGNORE identity_tbl_Identity SET iUserId = ? WHERE iUserId = ?`,
       [toUserId, fromUserId]
     );
     // Whatever IGNORE skipped was a duplicate of an identity the target
     // already holds; the source row is redundant either way.
-    await conn.query(`DELETE FROM id_tbl_Identity WHERE iUserId = ?`, [fromUserId]);
+    await conn.query(`DELETE FROM identity_tbl_Identity WHERE iUserId = ?`, [fromUserId]);
 
     const [revoked] = await conn.query<mysql.ResultSetHeader>(
-      `UPDATE id_tbl_Session SET dtRevoked = NOW(3)
+      `UPDATE identity_tbl_Session SET dtRevoked = NOW(3)
         WHERE iUserId = ? AND dtRevoked IS NULL`,
       [fromUserId]
     );
 
     // Keep an address on the surviving user if it had none.
     await conn.query(
-      `UPDATE id_tbl_User t
-          JOIN id_tbl_User f ON f.iUserId = ?
+      `UPDATE identity_tbl_User t
+          JOIN identity_tbl_User f ON f.iUserId = ?
           SET t.email = COALESCE(t.email, f.email),
               t.displayName = COALESCE(t.displayName, f.displayName)
         WHERE t.iUserId = ?`,
       [fromUserId, toUserId]
     );
 
-    await conn.query(`DELETE FROM id_tbl_User WHERE iUserId = ?`, [fromUserId]);
+    await conn.query(`DELETE FROM identity_tbl_User WHERE iUserId = ?`, [fromUserId]);
     await conn.commit();
 
     return { movedIdentities: moved.affectedRows, revokedSessions: revoked.affectedRows };

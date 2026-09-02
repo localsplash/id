@@ -97,7 +97,7 @@ export class IdApiError extends Error {
 }
 
 export class IdClient {
-  /** @param baseUrl e.g. `https://id.X.TLD` (no trailing slash needed). */
+  /** @param baseUrl e.g. `https://identity.X.TLD` (no trailing slash needed). */
   constructor(
     private readonly baseUrl: string,
     private readonly fetchImpl: typeof fetch = fetch

@@ -1,26 +1,25 @@
 # Standalone dev — for the full stack use EchoOrchestrator instead.
-# The MySQL here is disposable (local tests only); production id_db lives
-# on LSAidaOffice01 and is migrated by this app itself at boot.
+#
+# The identity service reads everything it needs from the NocoDB base
+# IdentityBase (table auth_tbl_Settings), including the coordinates of the
+# identity database. The only things stated here are how to reach that base.
 services:
-  id-web:
+  identity:
     build: .
-    container_name: id-web
+    container_name: identity
+    hostname: identity
     environment:
       PORT: "3200"
-      # The three things a deployment states: the settings store, its token,
-      # and the trusted network.
+      # The two things a deployment states.
       NOCODB_BASE_URL: ${NOCODB_BASE_URL:-http://host.docker.internal:18090}
       NOCODB_API_TOKEN: ${NOCODB_API_TOKEN:-}
-      # POC network trust: the docker bridge + loopback in dev.
-      ID_TRUSTED_NETWORK: ${ID_TRUSTED_NETWORK:-127.0.0.1/32,172.16.0.0/12}
-      ID_APP_AUTH_MODE: ${ID_APP_AUTH_MODE:-cidr}
-      ID_TRUSTED_PROXY_CIDRS: ${ID_TRUSTED_PROXY_CIDRS:-}
-      # Optional overrides of oAuthConfig rows. Blank counts as unset, so
-      # leaving these alone keeps the zero-config path: the public base URL
-      # is whatever URL the browser reached this service on, and the
-      # database coordinates come from the settings table. Point the dev
-      # stack at its disposable MySQL by exporting DB_HOST/DB_PORT/... in
-      # your shell, or fill the rows in NocoDB once.
+      # Optional overrides of auth_tbl_Settings rows. Blank counts as unset,
+      # so leaving these alone keeps the zero-config path: the public base
+      # URL is whatever URL the browser reached this service on, the trusted
+      # network and the database coordinates come from the settings table,
+      # and the first-run wizard collects what is missing.
+      IDENTITY_TRUSTED_NETWORK: ${IDENTITY_TRUSTED_NETWORK:-}
+      IDENTITY_TRUSTED_PROXY_CIDRS: ${IDENTITY_TRUSTED_PROXY_CIDRS:-}
       DB_HOST: ${DB_HOST:-}
       DB_PORT: ${DB_PORT:-}
       DB_USER: ${DB_USER:-}
