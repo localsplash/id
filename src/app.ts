@@ -1,10 +1,18 @@
 import express from 'express';
+import mysql from 'mysql2/promise';
 import path from 'path';
 import pinoHttp from 'pino-http';
 import pino from 'pino';
 import { loadConfig } from './config';
-import { getDb, dbCoordinates } from './db';
-import { SettingsStore, Settings } from './settings';
+import { getDb, dbCoordinates, resetDb, DbCoordinates } from './db';
+import { runMigrations } from './migrations';
+import {
+  SettingsStore,
+  Settings,
+  SettingsUnavailableError,
+  SETTINGS_BASE_NAME,
+  SETTINGS_TABLE_NAME,
+} from './settings';
 import {
   PROVIDERS,
   getProvider,
@@ -72,16 +80,18 @@ export function buildApp() {
    * fall back to "nothing configured" — the login page then honestly shows no
    * methods rather than the app crashing.
    */
+  /**
+   * Settings are read per request (30s cache in the store, IDs included) so
+   * a change in NocoDB takes effect without a restart.
+   *
+   * A failure is not swallowed. There is no fallback to "nothing is
+   * configured": that turns a missing base into a login page with no sign-in
+   * buttons, which reads as an application fault rather than the
+   * configuration fault it is. The error travels to the handler below, which
+   * answers 503 and says which of unreachable / missing / ambiguous it was.
+   */
   async function getSettings(): Promise<Settings> {
-    try {
-      return await settingsStore.getAll();
-    } catch (err) {
-      logger.error({ err }, '[settings] NocoDB read failed');
-      // Whatever the environment pins is still true when the store is not
-      // reachable; the rest reads as "nothing configured", so the login page
-      // honestly shows no methods rather than the app crashing.
-      return settingsStore.fromEnvOnly();
-    }
+    return settingsStore.getAll();
   }
 
   /**
@@ -123,7 +133,7 @@ export function buildApp() {
         state: 'unconfigured',
         hint:
           'The id_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME ' +
-          `(and DB_PASSWORD) in the ${config.NOCODB_TABLE_NAME} table in NocoDB, ` +
+          `(and DB_PASSWORD) in the ${SETTINGS_TABLE_NAME} table in NocoDB, ` +
           "or set them in this app's environment, then restart.",
       };
     }
@@ -154,16 +164,30 @@ export function buildApp() {
   // /api/directory/*) are protected by an explicit IPv4 allowlist. This
   // authenticates a trusted server/network, not an individual application —
   // apps sharing an allowed egress IP can call the same endpoints, which is
-  // accepted for the first-party POC on a controlled host. ID_APP_AUTH_MODE
-  // keeps the legacy ID_CLIENT_SECRET check available during rollout.
-  const appCidrs = parseCidrList(config.ID_TRUSTED_NETWORK);
-  const proxyCidrs = parseCidrList(config.ID_TRUSTED_PROXY_CIDRS);
+  // accepted for the first-party POC on a controlled host. IDENTITY_APP_AUTH_MODE
+  // keeps the legacy IDENTITY_CLIENT_SECRET check available during rollout.
+  const proxyCidrs = parseCidrList(config.IDENTITY_TRUSTED_PROXY_CIDRS);
 
-  /** True when the request's resolved IPv4 peer is inside the app allowlist. */
-  function peerIsTrusted(req: express.Request): boolean {
-    if (!appCidrs.length) return false;
+  // trustedCIDR is one setting for the whole platform, so it is read per
+  // request like every other setting — a change reaches every application
+  // within one cache interval, with no restart and no per-app spelling of
+  // the same network. Parsing is memoised on the string itself, so the
+  // hot path costs a comparison rather than a parse.
+  let cidrCache: { raw: string; parsed: ReturnType<typeof parseCidrList> } | null = null;
+  function trustedCidrs(settings: Settings): ReturnType<typeof parseCidrList> {
+    const raw = settings.trustedCIDR ?? '';
+    if (!cidrCache || cidrCache.raw !== raw) {
+      cidrCache = { raw, parsed: raw ? parseCidrList(raw) : [] };
+    }
+    return cidrCache.parsed;
+  }
+
+  /** True when the request's resolved IPv4 peer is inside the trusted network. */
+  function peerIsTrusted(req: express.Request, settings: Settings): boolean {
+    const cidrs = trustedCidrs(settings);
+    if (!cidrs.length) return false;
     const peer = resolveClientIp(req, proxyCidrs);
-    return peer !== null && ipInCidrs(peer.ipNum, appCidrs);
+    return peer !== null && ipInCidrs(peer.ipNum, cidrs);
   }
 
   /** Generic 403; the specifics go to the log, keyed by a correlation id. */
@@ -195,14 +219,17 @@ export function buildApp() {
     res: express.Response
   ): Promise<Settings | null> {
     const settings = await getSettings();
-    const mode = config.ID_APP_AUTH_MODE;
-    if (mode !== 'secret' && peerIsTrusted(req)) return settings;
+    const mode = config.IDENTITY_APP_AUTH_MODE;
+    if (mode !== 'secret' && peerIsTrusted(req, settings)) return settings;
     if (mode !== 'cidr') {
-      if (mode === 'secret' && !settings.ID_CLIENT_SECRET) {
-        res.status(503).json({ error: 'ID_CLIENT_SECRET is not configured' });
+      if (mode === 'secret' && !settings.IDENTITY_CLIENT_SECRET) {
+        res.status(503).json({ error: 'IDENTITY_CLIENT_SECRET is not configured' });
         return null;
       }
-      if (settings.ID_CLIENT_SECRET && secretsMatch(presentedSecret(req), settings.ID_CLIENT_SECRET)) {
+      if (
+        settings.IDENTITY_CLIENT_SECRET &&
+        secretsMatch(presentedSecret(req), settings.IDENTITY_CLIENT_SECRET)
+      ) {
         return settings;
       }
     }
@@ -214,8 +241,11 @@ export function buildApp() {
    * Admission for the directory API: always and only the CIDR allowlist —
    * no client-secret header or body field is accepted, in any mode.
    */
-  function requireTrustedPeer(req: express.Request, res: express.Response): boolean {
-    if (peerIsTrusted(req)) return true;
+  async function requireTrustedPeer(
+    req: express.Request,
+    res: express.Response
+  ): Promise<boolean> {
+    if (peerIsTrusted(req, await getSettings())) return true;
     denyUntrusted(req, res);
     return false;
   }
@@ -326,7 +356,33 @@ export function buildApp() {
   // ── Basic pages ────────────────────────────────────────────────────────────
 
   app.get('/healthz', (_req, res) => {
-    res.json({ ok: true, service: 'id' });
+    // Deliberately settings-free: it answers while the store is down, which
+    // is what makes it useful for telling "the process is up" apart from
+    // "the process cannot read its configuration".
+    res.json({ ok: true, service: 'identity' });
+  });
+
+  /**
+   * Is the settings store usable right now? This is what the retry on the
+   * unavailable page calls: invalidate() drops the cached base and table
+   * IDs, so a base that was missing (or renamed) a moment ago is re-detected
+   * rather than remembered as missing.
+   */
+  app.get('/api/settings/health', async (_req, res) => {
+    settingsStore.invalidate();
+    try {
+      await settingsStore.ping();
+      return res.json({ ok: true, base: SETTINGS_BASE_NAME, table: SETTINGS_TABLE_NAME });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return res.status(503).json({
+        ok: false,
+        error: message,
+        reason: err instanceof SettingsUnavailableError ? err.reason : 'unreachable',
+        base: SETTINGS_BASE_NAME,
+        nocodbUrl: config.NOCODB_BASE_URL,
+      });
+    }
   });
 
   app.get('/', async (req, res) => {
@@ -372,27 +428,13 @@ export function buildApp() {
     // internal infrastructure — so say only that, to anyone still asking.
     if (!isUnclaimed(settings)) return res.json({ unclaimed: false });
 
-    let nocodb: 'ok' | 'unconfigured' | 'unreachable' = 'ok';
-    let nocodbHint: string | undefined;
-    if (!settingsStore.isConfigured()) {
-      nocodb = 'unconfigured';
-      nocodbHint =
-        'NOCODB_API_TOKEN is not set. Generate an API token in NocoDB ' +
-        '(Account → Tokens) and set NOCODB_API_TOKEN (and NOCODB_BASE_URL) ' +
-        "in this app's environment, then restart it.";
-    } else {
-      try {
-        await settingsStore.ping();
-      } catch {
-        nocodb = 'unreachable';
-        nocodbHint =
-          `NocoDB at ${config.NOCODB_BASE_URL} did not accept the request. ` +
-          'Check NOCODB_BASE_URL and NOCODB_API_TOKEN in the environment.';
-      }
-    }
-
+    // Reaching this line proves the settings store answered: getSettings()
+    // throws otherwise and the 503 handler explains which of unreachable /
+    // missing / ambiguous it was. So the wizard only has to report on the
+    // other store.
+    //
     // The identity data has to be writable before anyone can claim the
-    // instance — the claimer becomes the first row in id_tbl_User.
+    // instance — the claimer becomes the first row in identity_tbl_User.
     const database = await probeDatabase();
 
     // A claim already in flight: enough to rebuild the request without
@@ -417,8 +459,6 @@ export function buildApp() {
     // let anyone contradict) or a row already in the store.
     return res.json({
       unclaimed: isUnclaimed(settings),
-      nocodb,
-      nocodbHint,
       database: database.state,
       databaseHint: database.hint,
       pending,
@@ -434,6 +474,73 @@ export function buildApp() {
       // shape ("identity.example.com") — the one default in this codebase.
       identityHostLabel: IDENTITY_HOST_LABEL,
     });
+  });
+
+  /**
+   * Step 0 of the wizard: where the identity data lives.
+   *
+   * The coordinates are settings, so the first run collects them the same
+   * way it collects everything else — typed once here, verified against a
+   * real connection, then written to the settings table. Nobody should have
+   * to hand-edit a row in NocoDB to get an instance to start.
+   */
+  app.post('/api/setup/database', async (req, res, next) => {
+    try {
+      settingsStore.invalidate();
+      if (!isUnclaimed(await getSettings())) {
+        return res.status(409).json({ error: 'This instance is already set up.' });
+      }
+
+      const body = (req.body ?? {}) as Record<string, string>;
+      const coords: DbCoordinates | null = dbCoordinates({
+        DB_HOST: String(body.host ?? ''),
+        DB_PORT: String(body.port ?? ''),
+        DB_USER: String(body.user ?? ''),
+        DB_PASSWORD: String(body.password ?? ''),
+        DB_NAME: String(body.database ?? ''),
+      });
+      if (!coords) {
+        return res.status(400).json({ error: 'Host, user and database name are required.' });
+      }
+
+      // Prove the coordinates before writing them: a settings table holding
+      // a database nobody can reach is worse than an empty one.
+      const probe = mysql.createPool({ ...coords, connectionLimit: 1, timezone: 'Z' });
+      try {
+        await probe.query('SELECT 1');
+      } catch (err) {
+        return res.status(400).json({
+          error:
+            `Could not connect to ${coords.host}:${coords.port}/${coords.database} — ` +
+            String(err instanceof Error ? err.message : err).slice(0, 200),
+        });
+      } finally {
+        await probe.end().catch(() => {});
+      }
+
+      for (const [key, value] of Object.entries({
+        DB_HOST: coords.host,
+        DB_PORT: String(coords.port),
+        DB_USER: coords.user,
+        DB_PASSWORD: coords.password,
+        DB_NAME: coords.database,
+      })) {
+        if (settingsStore.isOverridden(key)) continue;
+        await settingsStore.set(key, value);
+      }
+      settingsStore.invalidate();
+      resetDb(); // the next use connects with what was just saved
+
+      // Own the schema from the moment the coordinates are known.
+      const applied = await runMigrations(db);
+      logger.warn(
+        `[setup] identity database set to ${coords.host}:${coords.port}/${coords.database}` +
+          (applied.length ? ` (applied ${applied.join(', ')})` : '')
+      );
+      return res.json({ ok: true, migrations: applied });
+    } catch (err) {
+      next(err);
+    }
   });
 
   /**
@@ -500,20 +607,6 @@ export function buildApp() {
       if (!isUnclaimed(settings)) {
         return res.status(409).json({ error: 'This instance is already set up.' });
       }
-      if (!settingsStore.isConfigured()) {
-        return res.status(503).json({
-          error:
-            'NOCODB_API_TOKEN must be set in the environment before setup can save anything.',
-        });
-      }
-      try {
-        await settingsStore.ping();
-      } catch {
-        return res.status(503).json({
-          error: `NocoDB at ${config.NOCODB_BASE_URL} is unreachable or rejected the token — fix the environment first.`,
-        });
-      }
-
       const database = await probeDatabase();
       if (database.state !== 'ok') {
         return res.status(503).json({ error: database.hint });
@@ -688,8 +781,8 @@ export function buildApp() {
       if (settingsStore.isOverridden(key)) continue;
       await settingsStore.set(key, value);
     }
-    if (!current.ID_CLIENT_SECRET) {
-      await settingsStore.set('ID_CLIENT_SECRET', store.generateId(32));
+    if (!current.IDENTITY_CLIENT_SECRET) {
+      await settingsStore.set('IDENTITY_CLIENT_SECRET', store.generateId(32));
     }
     settingsStore.invalidate();
 
@@ -856,7 +949,7 @@ export function buildApp() {
           return res.redirect('/account?link_error=already_linked');
         }
         await store.ensureIdentity(db, linkSession.iUserId, provider.id, userInfo.sub, userInfo.email);
-        await db.query(`UPDATE id_tbl_User SET email = COALESCE(email, ?) WHERE iUserId = ?`, [
+        await db.query(`UPDATE identity_tbl_User SET email = COALESCE(email, ?) WHERE iUserId = ?`, [
           userInfo.email,
           linkSession.iUserId,
         ]);
@@ -966,7 +1059,7 @@ export function buildApp() {
    * The application proves the code was addressed to it (redirect_uri must
    * match what the code was minted for) and that it is one of ours: in the
    * POC its server's IPv4 peer is inside ID_TRUSTED_NETWORK (the legacy
-   * ID_CLIENT_SECRET check remains available via ID_APP_AUTH_MODE during
+   * IDENTITY_CLIENT_SECRET check remains available via IDENTITY_APP_AUTH_MODE during
    * rollout). Codes are single-use and expire in 5 minutes.
    *
    * user.superAdmin in the response is the consumed code's bSuperAdmin —
@@ -1119,7 +1212,7 @@ export function buildApp() {
    */
   app.post('/api/directory/users', async (req, res, next) => {
     try {
-      if (!requireTrustedPeer(req, res)) return;
+      if (!(await requireTrustedPeer(req, res))) return;
       const body = (req.body ?? {}) as Record<string, string>;
       const email = String(body.email ?? '').trim().toLowerCase();
       if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255) {
@@ -1136,7 +1229,7 @@ export function buildApp() {
 
   app.get('/api/directory/users/:iUserId', async (req, res, next) => {
     try {
-      if (!requireTrustedPeer(req, res)) return;
+      if (!(await requireTrustedPeer(req, res))) return;
       const iUserId = Number(req.params.iUserId);
       if (!Number.isInteger(iUserId) || iUserId <= 0) {
         return res.status(400).json({ error: 'Invalid iUserId' });
@@ -1151,7 +1244,7 @@ export function buildApp() {
 
   app.get('/api/directory/users', async (req, res, next) => {
     try {
-      if (!requireTrustedPeer(req, res)) return;
+      if (!(await requireTrustedPeer(req, res))) return;
       const query = String(req.query.query ?? '').trim().slice(0, 255);
       const limit = Number(req.query.limit ?? 25);
       const cursor = Number(req.query.cursor ?? 0);
@@ -1493,8 +1586,19 @@ export function buildApp() {
   // ── Error handler ──────────────────────────────────────────────────────────
 
   app.use(
-    (err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    (err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
       logger.error(err);
+      // A settings store that cannot answer is a configuration fault, and
+      // saying so beats a 500 or — worse — a page that renders as though
+      // nothing were configured. Browsers get the page with the retry;
+      // everything else gets the same sentence as JSON.
+      if (err instanceof SettingsUnavailableError) {
+        res.status(503);
+        if (req.accepts(['json', 'html']) === 'html') {
+          return res.sendFile(path.join(publicDir, 'unavailable.html'));
+        }
+        return res.json({ error: err.message, reason: err.reason });
+      }
       res.status(500).json({ error: 'Internal server error' });
     }
   );

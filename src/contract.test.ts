@@ -31,7 +31,7 @@ function ajv() {
 describe('OpenAPI contract document', () => {
   it('is OpenAPI 3.1 with normative X.TLD placeholders', () => {
     expect(spec.openapi).toBe('3.1.0');
-    expect(spec.servers[0].url).toBe('https://id.X.TLD');
+    expect(spec.servers[0].url).toBe('https://identity.X.TLD');
     // localsplash.ai must never appear normatively in the contract.
     expect(JSON.stringify(spec.servers)).not.toContain('localsplash.ai');
   });

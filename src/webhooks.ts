@@ -131,7 +131,7 @@ export async function emitEvent(
   options: { onlyOrigin?: string } = {}
 ): Promise<number> {
   const [result] = await pool.query<mysql.ResultSetHeader>(
-    `INSERT INTO id_tbl_Event (sType, jsonData) VALUES (?, ?)`,
+    `INSERT INTO identity_tbl_Event (sType, jsonData) VALUES (?, ?)`,
     [type, JSON.stringify(data)]
   );
   const iEventId = result.insertId;
@@ -144,8 +144,8 @@ export async function emitEvent(
   }
   // dtNextAttempt = now → the ticker picks it up on its next pass.
   await pool.query(
-    `INSERT IGNORE INTO id_tbl_Delivery (iEventId, sOrigin, dtNextAttempt)
-     SELECT ?, sOrigin, NOW(3) FROM id_tbl_App WHERE ${where}`,
+    `INSERT IGNORE INTO identity_tbl_Delivery (iEventId, sOrigin, dtNextAttempt)
+     SELECT ?, sOrigin, NOW(3) FROM identity_tbl_App WHERE ${where}`,
     params
   );
   return iEventId;
@@ -167,13 +167,13 @@ interface DueDelivery {
 
 async function markSuccess(pool: mysql.Pool, d: DueDelivery): Promise<void> {
   await pool.query(
-    `UPDATE id_tbl_Delivery
+    `UPDATE identity_tbl_Delivery
         SET dtDelivered = NOW(3), iAttempts = iAttempts + 1, dtNextAttempt = NULL, sLastError = NULL
       WHERE iDeliveryId = ?`,
     [d.iDeliveryId]
   );
   await pool.query(
-    `UPDATE id_tbl_App
+    `UPDATE identity_tbl_App
         SET dtLastDeliveryOk = NOW(3), iConsecutiveFailures = 0, sLastError = NULL
       WHERE sOrigin = ?`,
     [d.sOrigin]
@@ -186,7 +186,7 @@ async function markFailure(pool: mysql.Pool, d: DueDelivery, error: string): Pro
   const giveUp = backoff === undefined;
 
   await pool.query(
-    `UPDATE id_tbl_Delivery
+    `UPDATE identity_tbl_Delivery
         SET iAttempts = ?, sLastError = ?,
             dtNextAttempt = ${giveUp ? 'NULL' : '?'},
             dtAbandoned = ${giveUp ? 'NOW(3)' : 'NULL'}
@@ -201,7 +201,7 @@ async function markFailure(pool: mysql.Pool, d: DueDelivery, error: string): Pro
         ]
   );
   await pool.query(
-    `UPDATE id_tbl_App
+    `UPDATE identity_tbl_App
         SET dtLastDeliveryFail = NOW(3), iConsecutiveFailures = iConsecutiveFailures + 1,
             sLastError = ?
       WHERE sOrigin = ?`,
@@ -266,9 +266,9 @@ export async function drainDeliveries(pool: mysql.Pool, limit = 50): Promise<num
     `SELECT d.iDeliveryId, d.iEventId, d.sOrigin, d.iAttempts,
             e.sType, e.jsonData, e.dtCreated,
             a.sWebhookUrl, a.sSecret
-       FROM id_tbl_Delivery d
-       JOIN id_tbl_Event e ON e.iEventId = d.iEventId
-       JOIN id_tbl_App   a ON a.sOrigin  = d.sOrigin
+       FROM identity_tbl_Delivery d
+       JOIN identity_tbl_Event e ON e.iEventId = d.iEventId
+       JOIN identity_tbl_App   a ON a.sOrigin  = d.sOrigin
       WHERE d.dtDelivered IS NULL AND d.dtAbandoned IS NULL
         AND d.dtNextAttempt IS NOT NULL AND d.dtNextAttempt <= NOW(3)
         AND a.sWebhookUrl IS NOT NULL

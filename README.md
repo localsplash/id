@@ -1,8 +1,8 @@
-# id — OAuth identity processor & redirector
+# identity — OAuth identity processor & redirector
 
-`id` is the single sign-in surface for every application under one parent
+`identity` is the single sign-in surface for every application under one parent
 domain (`X.TLD`). Applications never talk to Google, Microsoft, or the UISP
-bridge themselves — they redirect the browser to `identity.X.TLD`, and `id` hands
+bridge themselves — they redirect the browser to `identity.X.TLD`, and `identity` hands
 back a one-time code that resolves to the signed-in identity.
 
 ```
@@ -28,7 +28,7 @@ GET https://identity.X.TLD/authorize?redirect_uri=https://app.X.TLD/auth/callbac
 subdomain of it — that is the entire client-registration model; every app
 under `X.TLD` is trusted, nothing else is. If the browser already carries a
 valid `id_sso` cookie (scoped to `.X.TLD`, so one login serves every app),
-`id` immediately 302s back with `?code=…&state=…`. Otherwise the login page
+`identity` immediately 302s back with `?code=…&state=…`. Otherwise the login page
 is shown and the round trip completes after the user authenticates.
 
 The app then redeems the code server-to-server:
@@ -45,7 +45,7 @@ POST https://identity.X.TLD/api/token
 Codes are single-use, expire in 5 minutes, and are bound to the exact
 `redirect_uri` they were minted for. No application secret is required:
 the calling server is admitted by **network trust** (below). The legacy
-`ID_CLIENT_SECRET` check still exists behind `ID_APP_AUTH_MODE` for the
+`IDENTITY_CLIENT_SECRET` check still exists behind `IDENTITY_APP_AUTH_MODE` for the
 rollout window.
 
 `user.superAdmin` is **session-scoped and never stored on the user row**.
@@ -60,10 +60,10 @@ recalculates privilege from the email.
 The server-only endpoints — `POST /api/token`, `POST /api/apps/register`,
 `GET /api/events`, and everything under `/api/directory/` — accept a
 request only when the caller's resolved IPv4 peer is inside
-`ID_TRUSTED_NETWORK` — one IPv4 CIDR naming the network the platform's
+`trustedCIDR` — one IPv4 CIDR naming the network the platform's
 servers sit on (`/32` and bare addresses accepted; a comma-separated list
 is still parsed for servers that straddle two ranges, and the pre-rollout
-name `ID_TRUSTED_APP_CIDRS` is still honoured). It describes a *network*,
+name `ID_TRUSTED_APP_CIDRS` (pre-rollout) is still honoured). It describes a *network*,
 not an application. Browser authorization stays public.
 
 Resolution rules, applied deterministically:
@@ -72,17 +72,17 @@ Resolution rules, applied deterministically:
   (a kernel-reported `::ffff:a.b.c.d` dual-stack peer is normalised to
   IPv4).
 - `X-Forwarded-For` is honoured **only** when the socket peer is inside
-  `ID_TRUSTED_PROXY_CIDRS`, and only across trusted hops evaluated
+  `IDENTITY_TRUSTED_PROXY_CIDRS`, and only across trusted hops evaluated
   right-to-left; the first non-proxy hop is the client. Malformed, IPv6,
   or IPv4-mapped entries in the header are rejected outright — a spoofed
   header from an untrusted peer changes nothing.
 - Denials are a generic `403 { "error": "Forbidden", "correlationId" }`;
   the log line carrying that correlation id records the resolved peer IP.
-- In production, startup **fails** when `ID_APP_AUTH_MODE` needs CIDRs and
-  `ID_TRUSTED_NETWORK` is empty, and when any CIDR entry is malformed.
+- In production, startup **fails** when `IDENTITY_APP_AUTH_MODE` needs CIDRs and
+  `trustedCIDR` is empty, and when any CIDR entry is malformed.
 
-`ID_APP_AUTH_MODE` is the rollout flag: `cidr` (POC default), `secret`
-(legacy `ID_CLIENT_SECRET` only), or `dual` (either accepted) for the
+`IDENTITY_APP_AUTH_MODE` is the rollout flag: `cidr` (POC default), `secret`
+(legacy `IDENTITY_CLIENT_SECRET` only), or `dual` (either accepted) for the
 migration window. The directory endpoints are CIDR-only in **every** mode —
 no client-secret header or body field is ever accepted there.
 
@@ -102,18 +102,18 @@ location ~ ^/api/(token|apps/register|events|directory) {
     allow 203.0.113.7/32;
     allow 10.9.0.0/16;
     deny  all;
-    proxy_pass http://id-web:3200;
+    proxy_pass http://identity:3200;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 # Everything else (authorize, login, account, admin) stays public.
 location / {
-    proxy_pass http://id-web:3200;
+    proxy_pass http://identity:3200;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 ```
 
 When NGINX fronts the app like this, put the NGINX host's IP in
-`ID_TRUSTED_PROXY_CIDRS` so the app evaluates the forwarded client
+`IDENTITY_TRUSTED_PROXY_CIDRS` so the app evaluates the forwarded client
 address; the application-layer check then re-applies the same allowlist.
 Firewall prerequisite: only the reverse proxy (and, on the controlled
 host, the app servers) may reach the app port at all — the allowlist is
@@ -167,7 +167,7 @@ model for their own local sessions.
 
 **UISP bridge.** The ISP-portal plugin (see EchoOrchestrator/uisp-plugin)
 verifies the subscriber's portal session and redirects to
-`/sso/callback?code&sig` with an HMAC-signed one-time payload. `id` verifies
+`/sso/callback?code&sig` with an HMAC-signed one-time payload. `identity` verifies
 the signature and nonce, records a `uisp` identity (subject = CRM clientId),
 and completes the pending app redirect — or `DEFAULT_REDIRECT_URI` when the
 user entered straight from the portal.
@@ -175,75 +175,115 @@ user entered straight from the portal.
 ## Configuration
 
 **Zero-config is the intended path.** A fresh instance is expected at
-`identity.X.TLD` and works out of the box. The `.env` carries three things
-and nothing else (see `.env.example`):
+`identity.X.TLD` and works out of the box. The `.env` carries two things and
+nothing else (see `.env.example`):
 
 | Variable | Why it cannot live in the settings table |
 | --- | --- |
 | `NOCODB_BASE_URL` | Where the settings table is |
 | `NOCODB_API_TOKEN` | How to read it |
-| `ID_TRUSTED_NETWORK` | Which network is trusted — a security boundary, not a setting an admin edits through a web page |
 
-Everything else — **the MySQL coordinates included** — is a row in the
-**`oAuthConfig` table** (base `id`) in NocoDB at `nocodb.X.TLD`, so a
-deployment is described in one place rather than split between a file on a
-host and a table. The settings table is created empty on first boot, and
-the setup wizard fills in where this service lives from the URL the first
-admin actually opens it on. `identity.X.TLD` is the one assumption the code
-makes; nothing else about a deployment is defaulted anywhere in the source.
+Everything else — the MySQL coordinates, the trusted network, the public
+URL, the OAuth credentials — is a row in the **`auth_tbl_Settings`** table of
+the **`IdentityBase`** base in NocoDB at `nocodb.X.TLD`.
+
+### Naming
+
+| Thing | Rule | Here |
+| --- | --- | --- |
+| Public URL | `{repo}.X.TLD`, lowercase | `identity.X.TLD` |
+| NocoDB base | `{Repo}Base` | `IdentityBase` |
+| Settings table | `auth_tbl_Settings` | `auth_tbl_Settings` |
+
+The short form `id` is retired: it reads as "identifier" everywhere it
+appears, which is genuinely ambiguous in an application whose primary key is
+one. Column names (`iUserId`), OAuth's own vocabulary (`client_id`) and the
+event names in the contract keep their spelling — there the word *does* mean
+identifier.
+
+### The base is found by name
+
+A base name is unique **by our convention** — NocoDB does not enforce it, we
+do — so the base ID is detected from the name at runtime and never written
+into a config file, where it would survive a rename and outlive a restore.
+Two bases sharing the name is a configuration error this app refuses to
+guess its way past.
+
+### Caching and refresh
+
+A change made in NocoDB reaches a running instance **without a restart**:
+
+- values are cached in-process for **30 seconds**;
+- the resolved **base ID and table ID sit on the same 30-second clock**, so a
+  rename, a recreate or a restore is picked up on the next refresh;
+- any failed read or resolution **drops the cache**, so the next attempt
+  re-detects rather than reusing an ID it could not confirm;
+- a write through `/admin` invalidates immediately (read-your-writes);
+- the retry on the unavailable page forces re-detection on demand.
+
+### Failure is loud
+
+There is no fallback. If NocoDB is unreachable, the token is rejected, or no
+base named `IdentityBase` exists:
+
+- **at startup** the app retries once after 5 seconds, then exits non-zero
+  naming the URL, the base and which of the three it was;
+- **at runtime** requests that need settings answer `503` — browsers get a
+  page saying what is wrong with a **Retry** that re-detects, everything else
+  gets the same sentence as JSON;
+- `/healthz` needs no settings and keeps answering, so "the process is up" is
+  distinguishable from "the process cannot read its configuration".
+
+### The settings
 
 | Key | Purpose |
 | --- | --- |
-| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | The MySQL id_db this app owns and migrates itself. Required — set them here (or in the environment) before first run; a change takes a restart |
+| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | The MySQL database this app owns and migrates itself. Collected by the first-run wizard; a change takes a restart |
+| `trustedCIDR` | **One value for the whole platform** — the network the servers sit on. Every application reads this same key rather than spelling the same network under its own name |
 | `PARENT_DOMAIN` | Apex domain (`X.TLD`) the **apps** are served from; drives the cookie scope and redirect allowlist, and is the default super-admin domain |
-| `APP_BASE_URL` | Public base URL of this app, e.g. `https://identity.X.TLD`. Normally left to the wizard — see *Where this service thinks it lives* below |
-| `ID_CLIENT_SECRET` | **Legacy (rollout only)** — shared secret apps present at `/api/token` when `ID_APP_AUTH_MODE` is `secret`/`dual`; ignored in the default `cidr` mode |
+| `APP_BASE_URL` | Public base URL, e.g. `https://identity.X.TLD`. Normally left to the wizard — see *Where this service thinks it lives* below |
+| `IDENTITY_CLIENT_SECRET` | **Legacy (rollout only)** — shared secret apps present at `/api/token` when `IDENTITY_APP_AUTH_MODE` is `secret`/`dual`; ignored in the default `cidr` mode |
 | `SUPERADMIN_DOMAIN` | Domain(s) the **identity provider vouches for** whose users are Super System Admins — comma-separated list accepted (default: `PARENT_DOMAIN`) |
 | `DEFAULT_REDIRECT_URI` | Where an unsolicited sign-in (e.g. from the ISP portal) lands |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth |
 | `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` / `MICROSOFT_TENANT` | Microsoft Entra ID OAuth |
 | `UISP_SSO_SECRET` / `UISP_PLUGIN_URL` / `UISP_BASE_URL` / `UISP_CRM_APP_KEY_READ` | UISP bridge & CRM |
 
-On first boot `id` creates the base/table and seeds every known key with an
-**empty** value and a description, so the menu of settings is visible
-without guessing. Seeded rows stay empty on purpose: a database being
-created for the first time is not where a public URL or a domain gets
-invented. **A login method is only offered when all of its required keys
-are set** — an unconfigured provider simply does not appear on the login
-page.
-
-Settings are re-read at most every 30 seconds; changes in NocoDB take
-effect without a restart.
+On first boot the base and table are created and every known key is seeded
+with an **empty** value and a description, so the menu of settings is visible
+without guessing. Seeded rows stay empty on purpose: a table being created
+for the first time is not where a public URL or a domain gets invented. **A
+login method is only offered when all of its required keys are set.**
 
 ### Environment overrides
 
-Any key in the table above may also be set in the **environment**, where it
-wins over the stored row. That is the escape hatch for deployments that
-manage configuration as environment (a Helm chart, a CI secret) or that
-need an instance up before NocoDB exists at all — it is an override, not a
-default, and the zero-config path leaves all of it unset.
+Any key above may also be set in the environment, where it wins over the
+stored row. That is the escape hatch for deployments that manage
+configuration as environment — an override, not a default, and the
+zero-config path leaves all of it unset. An overridden key is read-only in
+`/admin` (tagged `env`, `409` on any attempt to write it) and is never copied
+into the store. Blank counts as unset.
 
-An overridden key is read-only in `/admin` (tagged `env`, with a `409` on
-any attempt to write it) and is never copied into the store, since a copy
-would go stale the moment the environment changed. Blank counts as unset,
-so an empty variable in a compose file does not shadow the store.
+Two keys read oddly as variables and have environment-shaped aliases:
+`IDENTITY_TRUSTED_NETWORK` pins `trustedCIDR`, and the pre-rollout names
+`ID_TRUSTED_NETWORK`, `ID_TRUSTED_APP_CIDRS` and `ID_CLIENT_SECRET` are still
+honoured for one release.
 
 ### Where this service thinks it lives
 
-`APP_BASE_URL` is what the OAuth callback URIs are built from, and it is
-resolved per request in this order:
+`APP_BASE_URL` is what the OAuth callback URIs are built from, resolved per
+request in this order:
 
 1. the environment override, if there is one;
-2. the `APP_BASE_URL` row in `oAuthConfig` — what the setup wizard wrote;
+2. the `APP_BASE_URL` row — what the setup wizard wrote;
 3. the URL the browser actually reached this service on (honouring
    `X-Forwarded-Proto` / `X-Forwarded-Host` from a reverse proxy);
 4. `https://identity.<PARENT_DOMAIN>` — the naming convention, for the rare
    call with no request to observe.
 
-Leave 1 and 2 unset and the service is simply correct about itself: it is
-reachable at exactly the URL that reached it. `PARENT_DOMAIN` follows the
-same convention in the wizard — this host minus its own label, so
-`identity.wisp.net` proposes `wisp.net`.
+Leave 1 and 2 unset and the service is simply correct about itself.
+`PARENT_DOMAIN` follows the same convention in the wizard — this host minus
+its own label, so `identity.wisp.net` proposes `wisp.net`.
 
 ### First-run setup wizard
 
@@ -251,11 +291,13 @@ While no OAuth provider is configured, the instance is **unclaimed**: `/`
 redirects to `/setup`, a built-in wizard that walks the first admin through
 claiming it:
 
-1. It checks both stores first and names the one that is missing: if
-   `NOCODB_API_TOKEN` or `NOCODB_BASE_URL` is missing or wrong, those two
-   must be set in the environment before anything can be saved; if the
-   `DB_*` rows are unset or MySQL will not answer, the claim has nowhere to
-   record its first user. No form is shown until both answer.
+1. If the identity database is not set yet, the wizard asks for it first —
+   host, port, user, password, database — tests the connection before
+   saving anything, writes the coordinates to `auth_tbl_Settings`, and
+   applies the schema. Nobody has to hand-edit a row in NocoDB to get an
+   instance started. (The settings store itself is not diagnosed here: if
+   NocoDB were unreachable the whole app would be answering `503` with the
+   retry page instead.)
 2. The wizard fills in this service's public URL from the browser's own
    address bar and the application domain from that host minus its label
    (`identity.wisp.net` → `wisp.net`) — both editable, neither guessed
@@ -269,8 +311,8 @@ claiming it:
 3. The credentials are held in a short-lived cookie — *not* saved — while a
    real OAuth round trip runs against them.
 4. Only if the sign-in works **and** the verified account is on the Super
-   Admin domain does the wizard persist everything to `oAuthConfig` (also
-   minting `ID_CLIENT_SECRET`), make the claimer Super System Admin, and
+   Admin domain does the wizard persist everything to `auth_tbl_Settings` (also
+   minting `IDENTITY_CLIENT_SECRET`), make the claimer Super System Admin, and
    land them on `/admin`. A failed or off-domain attempt saves nothing.
 5. If the sign-in works but the account is on a *different* domain, the
    wizard says which domain the provider actually vouched for and offers it
@@ -288,7 +330,7 @@ domain is one of `SUPERADMIN_DOMAIN` (default: `PARENT_DOMAIN`). Only
 providers that cryptographically vouch for the domain qualify — Google
 (Workspace `hd` / verified address) does; Microsoft only when the app is
 locked to a single tenant, since with a `common` authority any directory
-could assert any address. Admins can edit `oAuthConfig`, inspect users and
+could assert any address. Admins can edit `auth_tbl_Settings`, inspect users and
 identities, unlink identities (never a user's last one), and revoke
 sessions.
 
@@ -459,25 +501,25 @@ so no schema change is needed.
 
 ## Storage
 
-Identity data lives in MySQL (`id_db`) — the shared platform identity
+Identity data lives in MySQL (the identity database) — the shared platform identity
 database on **LSAidaOffice01** — and **this repository is its sole schema
 owner**. There is no external schema source: `EchoDatabase/init` is not
-used and must not be. `id_db.id_tbl_User.iUserId` is the platform-wide
+used and must not be. `identity_db.identity_tbl_User.iUserId` is the platform-wide
 person id; tenant, role, extension, and prompt data belong to the
 applications (e.g. Aida UID mappings in NocoDB), never as columns here.
 
-- `id_tbl_User` — people
-- `id_tbl_Identity` — login methods per user (`provider`, `subject`)
-- `id_tbl_Session` — revocable, non-expiring SSO sessions
-- `id_tbl_AuthCode` — one-time app handoff codes
-- `id_tbl_App` / `id_tbl_Event` / `id_tbl_Delivery` — app registry & events
-- `id_tbl_SsoNonce` — UISP bridge replay guard
-- `id_tbl_DirectoryKey` — directory-ensure idempotency keys
-- `id_tbl_Migration` — applied-migration history
+- `identity_tbl_User` — people
+- `identity_tbl_Identity` — login methods per user (`provider`, `subject`)
+- `identity_tbl_Session` — revocable, non-expiring SSO sessions
+- `identity_tbl_AuthCode` — one-time app handoff codes
+- `identity_tbl_App` / `identity_tbl_Event` / `identity_tbl_Delivery` — app registry & events
+- `identity_tbl_SsoNonce` — UISP bridge replay guard
+- `identity_tbl_DirectoryKey` — directory-ensure idempotency keys
+- `identity_tbl_Migration` — applied-migration history
 
 **Where its coordinates come from.** `DB_HOST` / `DB_PORT` / `DB_USER` /
 `DB_PASSWORD` / `DB_NAME` are settings like any other — rows in
-`oAuthConfig`, or environment overrides — so a deployment is described in
+`auth_tbl_Settings`, or environment overrides — so a deployment is described in
 one place. The pool connects lazily on first use, which makes "not filled
 in yet" an ordinary first-run state rather than a crash: the app still
 listens, `/setup` says which of the two stores is missing, and the schema is
@@ -488,7 +530,7 @@ restart.
 
 The schema is applied at boot by `src/migrations.ts`: an ordered,
 append-only list of named, **additive** migrations, each recorded in
-`id_tbl_Migration`. A fresh database gets everything; an existing one gets
+`identity_tbl_Migration`. A fresh database gets everything; an existing one gets
 only what it has not seen; a second run is a no-op; concurrent boots are
 serialised by an advisory lock. The baseline migration is written as
 `CREATE TABLE IF NOT EXISTS`, so a database created by an earlier
@@ -501,15 +543,15 @@ reorder a released one.
 **Local vs production.** `docker-compose.yml` / `.env.example` show how to
 point a dev instance at a disposable local MySQL (export `DB_HOST` and
 friends, or fill the rows in NocoDB once). Production is the shared
-`id_db` on LSAidaOffice01 (`DB_HOST` pointing at that MySQL) — treat it as
+the identity database on LSAidaOffice01 (`DB_HOST` pointing at that MySQL) — treat it as
 live data at all times.
 
 **Backup / restore / rollback (production).** Take a consistent dump
 before every deploy that includes a new migration:
 
 ```bash
-mysqldump --single-transaction --routines id_db > id_db-$(date +%F).sql   # backup
-mysql id_db < id_db-<date>.sql                                            # restore
+mysqldump --single-transaction --routines identity_db > identity_db-$(date +%F).sql   # backup
+mysql identity_db < identity_db-<date>.sql                                            # restore
 ```
 
 Because migrations are additive, rolling back the *app* to a previous

@@ -27,8 +27,10 @@ const fake = {
   settings: {} as Record<string, string>,
   /** Keys the environment pins — they win over `settings` and cannot be written. */
   overrides: {} as Record<string, string>,
-  /** State of id_db as the wizard's probe would find it. */
+  /** State of the identity database as the wizard's probe would find it. */
   db: 'ok' as 'ok' | 'unconfigured' | 'unreachable',
+  /** When set, the settings store fails with this reason. */
+  settingsError: null as string | null,
   sessions: new Map<string, FakeSession>(),
   authCodes: new Map<
     string,
@@ -43,6 +45,7 @@ function resetFakes() {
   fake.settings = { PARENT_DOMAIN: 'wisp.net' };
   fake.overrides = {};
   fake.db = 'ok';
+  fake.settingsError = null;
   fake.sessions.clear();
   fake.authCodes.clear();
   fake.users.clear();
@@ -67,9 +70,30 @@ vi.mock('./db', () => ({
 }));
 
 vi.mock('./settings', () => {
+  class SettingsUnavailableError extends Error {
+    constructor(
+      public reason: string,
+      message: string
+    ) {
+      super(message);
+      this.name = 'SettingsUnavailableError';
+    }
+  }
+  const failIfAsked = () => {
+    if (fake.settingsError) {
+      throw new SettingsUnavailableError(
+        fake.settingsError,
+        `No NocoDB base named IdentityBase at http://nocodb.test (${fake.settingsError})`
+      );
+    }
+  };
   class SettingsStore {
     async getAll() {
+      failIfAsked();
       return { ...fake.settings, ...fake.overrides };
+    }
+    async ping() {
+      failIfAsked();
     }
     fromEnvOnly() {
       return { ...fake.overrides };
@@ -87,8 +111,9 @@ vi.mock('./settings', () => {
     isConfigured() {
       return true;
     }
-    async ping() {}
-    async bootstrap() {}
+    async bootstrap() {
+      failIfAsked();
+    }
     async listForAdmin() {
       return Object.entries({ ...fake.settings, ...fake.overrides }).map(([key, value]) => ({
         key,
@@ -101,7 +126,12 @@ vi.mock('./settings', () => {
       fake.settings[key] = value;
     }
   }
-  return { SettingsStore };
+  return {
+    SettingsStore,
+    SettingsUnavailableError,
+    SETTINGS_BASE_NAME: 'IdentityBase',
+    SETTINGS_TABLE_NAME: 'auth_tbl_Settings',
+  };
 });
 
 vi.mock('./webhooks', () => ({
@@ -201,16 +231,25 @@ vi.mock('./store', () => {
 import { buildApp } from './app';
 
 const ENV_KEYS = [
+  'IDENTITY_APP_AUTH_MODE',
+  'IDENTITY_TRUSTED_PROXY_CIDRS',
   'ID_APP_AUTH_MODE',
-  'ID_TRUSTED_NETWORK',
-  'ID_TRUSTED_APP_CIDRS',
   'ID_TRUSTED_PROXY_CIDRS',
   'NODE_ENV',
 ] as const;
 
-function makeApp(env: Partial<Record<(typeof ENV_KEYS)[number], string>>) {
+/**
+ * `trustedCIDR` is a setting, not an environment variable — one value for
+ * the whole platform, read from the settings store per request — so the
+ * harness seeds it there and leaves the environment for the rest.
+ */
+function makeApp(
+  opts: Partial<Record<(typeof ENV_KEYS)[number], string>> & { trustedCIDR?: string } = {}
+) {
+  const { trustedCIDR, ...env } = opts;
   for (const k of ENV_KEYS) delete process.env[k];
   Object.assign(process.env, env);
+  if (trustedCIDR !== undefined) fake.settings.trustedCIDR = trustedCIDR;
   return buildApp().app;
 }
 
@@ -243,8 +282,8 @@ beforeEach(resetFakes);
 // ── CIDR admission on the app endpoints ──────────────────────────────────────
 
 describe('CIDR trust on /api/token, /api/apps/register, /api/events', () => {
-  it('allows a peer inside ID_TRUSTED_APP_CIDRS (exact /32), no client secret needed', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+  it('allows a peer inside trustedCIDR (exact /32), no client secret needed', async () => {
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app).get('/api/events?since=0');
     expect(res.status).toBe(200);
     expect(res.body.items).toEqual([]);
@@ -253,15 +292,15 @@ describe('CIDR trust on /api/token, /api/apps/register, /api/events', () => {
   it('allows a peer inside a subnet range', async () => {
     // Trusted-proxy loopback lets the test present a subnet client address.
     const app = makeApp({
-      ID_TRUSTED_APP_CIDRS: ELSEWHERE,
-      ID_TRUSTED_PROXY_CIDRS: LOOPBACK,
+      trustedCIDR: ELSEWHERE,
+      IDENTITY_TRUSTED_PROXY_CIDRS: LOOPBACK,
     });
     const res = await request(app).get('/api/events?since=0').set('X-Forwarded-For', '10.9.44.5');
     expect(res.status).toBe(200);
   });
 
   it('rejects a peer outside the allowlist with a generic 403 + correlation id', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: ELSEWHERE });
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
     const res = await request(app).get('/api/events?since=0');
     expect(res.status).toBe(403);
     expect(res.body.error).toBe('Forbidden');
@@ -275,15 +314,15 @@ describe('CIDR trust on /api/token, /api/apps/register, /api/events', () => {
   });
 
   it('ignores a spoofed X-Forwarded-For when the peer is not a trusted proxy', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: ELSEWHERE });
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
     const res = await request(app).get('/api/events?since=0').set('X-Forwarded-For', '10.9.0.5');
     expect(res.status).toBe(403);
   });
 
   it('rejects IPv6/mapped forms smuggled through a trusted proxy header', async () => {
     const app = makeApp({
-      ID_TRUSTED_APP_CIDRS: ELSEWHERE,
-      ID_TRUSTED_PROXY_CIDRS: LOOPBACK,
+      trustedCIDR: ELSEWHERE,
+      IDENTITY_TRUSTED_PROXY_CIDRS: LOOPBACK,
     });
     for (const spoof of ['::ffff:10.9.0.5', '2001:db8::1', 'garbage']) {
       const res = await request(app).get('/api/events?since=0').set('X-Forwarded-For', spoof);
@@ -293,8 +332,8 @@ describe('CIDR trust on /api/token, /api/apps/register, /api/events', () => {
 
   it('evaluates a reverse-proxy chain only across configured trusted hops', async () => {
     const app = makeApp({
-      ID_TRUSTED_APP_CIDRS: ELSEWHERE,
-      ID_TRUSTED_PROXY_CIDRS: `${LOOPBACK}, 172.16.0.0/24`,
+      trustedCIDR: ELSEWHERE,
+      IDENTITY_TRUSTED_PROXY_CIDRS: `${LOOPBACK}, 172.16.0.0/24`,
     });
     // client 10.9.0.5 → proxy 172.16.0.2 → loopback → id: allowed
     const ok = await request(app)
@@ -309,10 +348,10 @@ describe('CIDR trust on /api/token, /api/apps/register, /api/events', () => {
   });
 });
 
-describe('ID_APP_AUTH_MODE rollout flag', () => {
+describe('IDENTITY_APP_AUTH_MODE rollout flag', () => {
   it("mode=cidr ignores a valid legacy secret from an untrusted peer", async () => {
-    fake.settings.ID_CLIENT_SECRET = 's3cret';
-    const app = makeApp({ ID_APP_AUTH_MODE: 'cidr', ID_TRUSTED_APP_CIDRS: ELSEWHERE });
+    fake.settings.IDENTITY_CLIENT_SECRET = 's3cret';
+    const app = makeApp({ IDENTITY_APP_AUTH_MODE: 'cidr', trustedCIDR: ELSEWHERE });
     const res = await request(app)
       .get('/api/events?since=0')
       .set('X-Id-Client-Secret', 's3cret');
@@ -320,8 +359,8 @@ describe('ID_APP_AUTH_MODE rollout flag', () => {
   });
 
   it('mode=secret keeps the legacy check and does not require a CIDR match', async () => {
-    fake.settings.ID_CLIENT_SECRET = 's3cret';
-    const app = makeApp({ ID_APP_AUTH_MODE: 'secret', ID_TRUSTED_APP_CIDRS: ELSEWHERE });
+    fake.settings.IDENTITY_CLIENT_SECRET = 's3cret';
+    const app = makeApp({ IDENTITY_APP_AUTH_MODE: 'secret', trustedCIDR: ELSEWHERE });
     const ok = await request(app).get('/api/events?since=0').set('X-Id-Client-Secret', 's3cret');
     expect(ok.status).toBe(200);
     const bad = await request(app).get('/api/events?since=0').set('X-Id-Client-Secret', 'wrong');
@@ -329,11 +368,11 @@ describe('ID_APP_AUTH_MODE rollout flag', () => {
   });
 
   it('mode=dual accepts either a trusted peer or a valid secret', async () => {
-    fake.settings.ID_CLIENT_SECRET = 's3cret';
-    const byIp = makeApp({ ID_APP_AUTH_MODE: 'dual', ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    fake.settings.IDENTITY_CLIENT_SECRET = 's3cret';
+    const byIp = makeApp({ IDENTITY_APP_AUTH_MODE: 'dual', trustedCIDR: LOOPBACK });
     expect((await request(byIp).get('/api/events?since=0')).status).toBe(200);
 
-    const bySecret = makeApp({ ID_APP_AUTH_MODE: 'dual', ID_TRUSTED_APP_CIDRS: ELSEWHERE });
+    const bySecret = makeApp({ IDENTITY_APP_AUTH_MODE: 'dual', trustedCIDR: ELSEWHERE });
     expect(
       (await request(bySecret).get('/api/events?since=0').set('X-Id-Client-Secret', 's3cret')).status
     ).toBe(200);
@@ -347,13 +386,13 @@ describe('ID_APP_AUTH_MODE rollout flag', () => {
 
 describe('superAdmin provenance: Session → AuthCode → redemption', () => {
   async function authorizeAndRedeem(session: { iUserId: number; bSuperAdmin: boolean; email: string | null }) {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const sessionId = seedSession(session);
 
     const auth = await request(app)
       .get('/authorize')
       .query({ redirect_uri: REDIRECT, state: 'opaque-123' })
-      .set('Cookie', `id_sso=${sessionId}`);
+      .set('Cookie', `identity_sso=${sessionId}`);
     expect(auth.status).toBe(302);
     const location = new URL(auth.headers.location);
     expect(`${location.origin}${location.pathname}`).toBe(REDIRECT);
@@ -391,12 +430,12 @@ describe('superAdmin provenance: Session → AuthCode → redemption', () => {
   });
 
   it('codes are single-use and bound to the exact redirect_uri', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const sessionId = seedSession({ iUserId: 9, bSuperAdmin: false, email: 'a@wisp.net' });
     const auth = await request(app)
       .get('/authorize')
       .query({ redirect_uri: REDIRECT })
-      .set('Cookie', `id_sso=${sessionId}`);
+      .set('Cookie', `identity_sso=${sessionId}`);
     const code = new URL(auth.headers.location).searchParams.get('code')!;
 
     const wrongUri = await request(app)
@@ -416,8 +455,8 @@ describe('superAdmin provenance: Session → AuthCode → redemption', () => {
 
 describe('directory API', () => {
   it('is CIDR-only: a valid client secret never grants access, in any mode', async () => {
-    fake.settings.ID_CLIENT_SECRET = 's3cret';
-    const app = makeApp({ ID_APP_AUTH_MODE: 'dual', ID_TRUSTED_APP_CIDRS: ELSEWHERE });
+    fake.settings.IDENTITY_CLIENT_SECRET = 's3cret';
+    const app = makeApp({ IDENTITY_APP_AUTH_MODE: 'dual', trustedCIDR: ELSEWHERE });
     const res = await request(app)
       .post('/api/directory/users')
       .set('X-Id-Client-Secret', 's3cret')
@@ -426,7 +465,7 @@ describe('directory API', () => {
   });
 
   it('ensure is idempotent and returns minimal fields only', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const first = await request(app)
       .post('/api/directory/users')
       .send({ email: 'Ada@Wisp.NET', displayName: 'Ada', idempotencyKey: 'k1' });
@@ -445,7 +484,7 @@ describe('directory API', () => {
   });
 
   it('validates input', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     expect((await request(app).post('/api/directory/users').send({})).status).toBe(400);
     expect(
       (await request(app).post('/api/directory/users').send({ email: 'not-an-email' })).status
@@ -453,7 +492,7 @@ describe('directory API', () => {
   });
 
   it('gets a user by iUserId and 404s unknown ids without leaking', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const created = await request(app)
       .post('/api/directory/users')
       .send({ email: 'b@wisp.net' });
@@ -465,7 +504,7 @@ describe('directory API', () => {
   });
 
   it('searches with bounded pagination and a cursor', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     for (let i = 1; i <= 4; i++) {
       await request(app).post('/api/directory/users').send({ email: `user${i}@wisp.net` });
     }
@@ -486,7 +525,7 @@ describe('directory API', () => {
   });
 
   it('rejects browser-style requests from outside the allowlist', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: ELSEWHERE });
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
     const res = await request(app).get('/api/directory/users?query=a');
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: 'Forbidden', correlationId: expect.any(String) });
@@ -509,7 +548,7 @@ describe('APP_BASE_URL resolution', () => {
   }
 
   it('offers no server-side guess to the wizard, only what is already pinned', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app).get('/api/setup/status').set('Host', 'identity.wisp.net');
     expect(res.status).toBe(200);
     expect(res.body.pinned).toEqual({ appBaseUrl: '', parentDomain: 'wisp.net' });
@@ -519,14 +558,14 @@ describe('APP_BASE_URL resolution', () => {
 
   it('reports a pinned value as locked so the wizard cannot contradict it', async () => {
     fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app).get('/api/setup/status');
     expect(res.body.pinned.appBaseUrl).toBe('https://identity.wisp.net');
     expect(res.body.locked.appBaseUrl).toBe(true);
   });
 
   it('builds the OAuth callback from the URL the browser reported', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app)
       .post('/api/setup/start')
       .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net/setup', ...CREDENTIALS });
@@ -535,7 +574,7 @@ describe('APP_BASE_URL resolution', () => {
   });
 
   it('falls back to the request when the browser sends nothing', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app)
       .post('/api/setup/start')
       .set('X-Forwarded-Proto', 'https')
@@ -546,7 +585,7 @@ describe('APP_BASE_URL resolution', () => {
   });
 
   it('rejects a base URL that is not one', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app)
       .post('/api/setup/start')
       .send({ parentDomain: 'wisp.net', appBaseUrl: 'identity.wisp.net', ...CREDENTIALS });
@@ -555,7 +594,7 @@ describe('APP_BASE_URL resolution', () => {
   });
 
   it('in production, refuses a base URL off the domain being claimed', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK, NODE_ENV: 'production' });
+    const app = makeApp({ trustedCIDR: LOOPBACK, NODE_ENV: 'production' });
     const off = await request(app)
       .post('/api/setup/start')
       .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.attacker.example', ...CREDENTIALS });
@@ -570,7 +609,7 @@ describe('APP_BASE_URL resolution', () => {
 
   it('lets the environment override win over the browser', async () => {
     fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app)
       .post('/api/setup/start')
       .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://somewhere.else.example', ...CREDENTIALS });
@@ -582,9 +621,9 @@ describe('APP_BASE_URL resolution', () => {
 describe('/admin config and the environment', () => {
   it('reports each setting with the source that is actually in force', async () => {
     fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
-    const res = await request(app).get('/api/admin/config').set('Cookie', `id_sso=${session}`);
+    const res = await request(app).get('/api/admin/config').set('Cookie', `identity_sso=${session}`);
     expect(res.status).toBe(200);
     expect(res.body.appBaseUrl).toBe('https://identity.wisp.net');
     expect(res.body.appBaseUrlSource).toBe('environment');
@@ -595,11 +634,11 @@ describe('/admin config and the environment', () => {
   });
 
   it('says the callback URLs follow the request when nothing pins them', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
     const res = await request(app)
       .get('/api/admin/config')
-      .set('Cookie', `id_sso=${session}`)
+      .set('Cookie', `identity_sso=${session}`)
       .set('X-Forwarded-Proto', 'https')
       .set('X-Forwarded-Host', 'identity.wisp.net');
     expect(res.body.appBaseUrl).toBe('https://identity.wisp.net');
@@ -608,11 +647,11 @@ describe('/admin config and the environment', () => {
 
   it('refuses a write to a key the environment pins, and says why', async () => {
     fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
     const res = await request(app)
       .put('/api/admin/config/APP_BASE_URL')
-      .set('Cookie', `id_sso=${session}`)
+      .set('Cookie', `identity_sso=${session}`)
       .send({ value: 'https://elsewhere.wisp.net' });
     expect(res.status).toBe(409);
     expect(res.body.error).toContain('environment');
@@ -620,25 +659,69 @@ describe('/admin config and the environment', () => {
   });
 });
 
-// ── The .env carries three things; the rest is settings ──────────────────────
+// ── The .env carries two things; the rest is settings ────────────────────────
 
 describe('trusted network', () => {
-  it('is one CIDR value under ID_TRUSTED_NETWORK', async () => {
-    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+  it('is one value read from the settings, not the environment', async () => {
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     expect((await request(app).get('/api/events?since=0')).status).toBe(200);
 
-    const elsewhere = makeApp({ ID_TRUSTED_NETWORK: ELSEWHERE });
+    const elsewhere = makeApp({ trustedCIDR: ELSEWHERE });
     expect((await request(elsewhere).get('/api/events?since=0')).status).toBe(403);
   });
 
-  it('still honours the pre-rollout ID_TRUSTED_APP_CIDRS name', async () => {
-    const app = makeApp({ ID_TRUSTED_APP_CIDRS: LOOPBACK });
+  it('follows a change in the settings without a restart', async () => {
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
+    expect((await request(app).get('/api/events?since=0')).status).toBe(403);
+
+    // What a NocoDB edit looks like once the 30s cache has turned over.
+    fake.settings.trustedCIDR = LOOPBACK;
     expect((await request(app).get('/api/events?since=0')).status).toBe(200);
   });
 
-  it('prefers the new name when a deployment sets both', async () => {
-    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK, ID_TRUSTED_APP_CIDRS: ELSEWHERE });
-    expect((await request(app).get('/api/events?since=0')).status).toBe(200);
+  it('trusts nobody when it is unset', async () => {
+    const app = makeApp({});
+    expect((await request(app).get('/api/events?since=0')).status).toBe(403);
+  });
+});
+
+/**
+ * No fallback: an app that cannot read its configuration says so. The
+ * alternative — carrying on as though nothing were configured — renders a
+ * missing base as a login page with no buttons, which reads as an
+ * application fault rather than the configuration fault it is.
+ */
+describe('settings store unavailable', () => {
+  it('answers 503 and names the reason instead of pretending', async () => {
+    fake.settingsError = 'base_missing';
+    const app = makeApp({ trustedCIDR: LOOPBACK });
+
+    const page = await request(app).get('/').set('Accept', 'text/html');
+    expect(page.status).toBe(503);
+
+    const api = await request(app).get('/api/providers').set('Accept', 'application/json');
+    expect(api.status).toBe(503);
+    expect(api.body.reason).toBe('base_missing');
+    expect(api.body.error).toContain('IdentityBase');
+  });
+
+  it('keeps answering /healthz, which needs no settings', async () => {
+    fake.settingsError = 'unreachable';
+    const app = makeApp({ trustedCIDR: LOOPBACK });
+    const res = await request(app).get('/healthz');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, service: 'identity' });
+  });
+
+  it('re-detects on retry rather than remembering the failure', async () => {
+    fake.settingsError = 'base_missing';
+    const app = makeApp({ trustedCIDR: LOOPBACK });
+    expect((await request(app).get('/api/settings/health')).status).toBe(503);
+
+    fake.settingsError = null; // the base was created (or renamed back)
+    const res = await request(app).get('/api/settings/health');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, base: 'IdentityBase', table: 'auth_tbl_Settings' });
   });
 });
 
@@ -652,7 +735,7 @@ describe('id_db as a setting', () => {
 
   it('tells the wizard the database is not configured yet', async () => {
     fake.db = 'unconfigured';
-    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app).get('/api/setup/status');
     expect(res.status).toBe(200);
     expect(res.body.database).toBe('unconfigured');
@@ -661,14 +744,14 @@ describe('id_db as a setting', () => {
 
   it('reports an unreachable database separately from an unset one', async () => {
     fake.db = 'unreachable';
-    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app).get('/api/setup/status');
     expect(res.body.database).toBe('unreachable');
   });
 
   it('refuses to start a claim it could not record', async () => {
     fake.db = 'unconfigured';
-    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app)
       .post('/api/setup/start')
       .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net', ...CREDENTIALS });
@@ -677,12 +760,32 @@ describe('id_db as a setting', () => {
   });
 
   it('proceeds once both stores answer', async () => {
-    const app = makeApp({ ID_TRUSTED_NETWORK: LOOPBACK });
+    const app = makeApp({ trustedCIDR: LOOPBACK });
     const status = await request(app).get('/api/setup/status');
     expect(status.body.database).toBe('ok');
     const res = await request(app)
       .post('/api/setup/start')
       .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net', ...CREDENTIALS });
     expect(res.status).toBe(200);
+  });
+});
+
+describe('first-run database step', () => {
+  it('refuses coordinates it could not connect to, and saves nothing', async () => {
+    fake.db = 'unconfigured';
+    const app = makeApp({ trustedCIDR: LOOPBACK });
+    const res = await request(app)
+      .post('/api/setup/database')
+      .send({ host: 'nope.invalid', user: 'identity', database: 'identity_db' });
+    expect(res.status).toBe(400);
+    expect(fake.settings.DB_HOST).toBeUndefined();
+  });
+
+  it('requires host, user and database', async () => {
+    fake.db = 'unconfigured';
+    const app = makeApp({ trustedCIDR: LOOPBACK });
+    const res = await request(app).post('/api/setup/database').send({ host: 'mysql.internal' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('required');
   });
 });

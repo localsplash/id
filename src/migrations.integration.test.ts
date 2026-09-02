@@ -49,16 +49,16 @@ suite('id_db migrations (real MySQL)', () => {
     expect(applied).toEqual(MIGRATIONS.map((m) => m.name));
     const tables = await tableNames();
     for (const t of [
-      'id_tbl_User',
-      'id_tbl_Identity',
-      'id_tbl_Session',
-      'id_tbl_AuthCode',
-      'id_tbl_App',
-      'id_tbl_Event',
-      'id_tbl_Delivery',
-      'id_tbl_SsoNonce',
-      'id_tbl_DirectoryKey',
-      'id_tbl_Migration',
+      'identity_tbl_User',
+      'identity_tbl_Identity',
+      'identity_tbl_Session',
+      'identity_tbl_AuthCode',
+      'identity_tbl_App',
+      'identity_tbl_Event',
+      'identity_tbl_Delivery',
+      'identity_tbl_SsoNonce',
+      'identity_tbl_DirectoryKey',
+      'identity_tbl_Migration',
     ]) {
       expect(tables).toContain(t);
     }
@@ -72,24 +72,24 @@ suite('id_db migrations (real MySQL)', () => {
   it('upgrades a pre-ownership database without data loss', async () => {
     // Simulate a database created by an earlier deployment: the current
     // tables and data exist, but no migration history was ever recorded.
-    await pool.query(`INSERT INTO id_tbl_User (email, displayName) VALUES (?, ?)`, [
+    await pool.query(`INSERT INTO identity_tbl_User (email, displayName) VALUES (?, ?)`, [
       'ada@x.tld',
       'Ada',
     ]);
     const [before] = await pool.query<mysql.RowDataPacket[]>(
-      `SELECT iUserId FROM id_tbl_User WHERE email = 'ada@x.tld'`
+      `SELECT iUserId FROM identity_tbl_User WHERE email = 'ada@x.tld'`
     );
     const iUserId = before[0].iUserId as number;
 
-    await pool.query(`DROP TABLE id_tbl_DirectoryKey`);
-    await pool.query(`DROP TABLE id_tbl_Migration`);
+    await pool.query(`DROP TABLE identity_tbl_DirectoryKey`);
+    await pool.query(`DROP TABLE identity_tbl_Migration`);
 
     const applied = await runMigrations(pool);
     expect(applied).toEqual(MIGRATIONS.map((m) => m.name));
 
     // Existing users retain their iUserId (and can therefore authenticate).
     const [after] = await pool.query<mysql.RowDataPacket[]>(
-      `SELECT iUserId, email, displayName FROM id_tbl_User WHERE email = 'ada@x.tld'`
+      `SELECT iUserId, email, displayName FROM identity_tbl_User WHERE email = 'ada@x.tld'`
     );
     expect(after).toHaveLength(1);
     expect(after[0].iUserId).toBe(iUserId);

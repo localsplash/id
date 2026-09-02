@@ -36,6 +36,54 @@
     <!-- A store is not usable: setup cannot save anything -->
     <div id="storeBlock" class="hidden my-4 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800"></div>
 
+    <!-- Step 0: where the identity data lives. Shown only when unset. -->
+    <form id="dbForm" class="hidden mt-6 space-y-4">
+      <p class="text-sm text-slate-600">
+        First, where the identity data lives. This is the MySQL database this
+        app owns and migrates itself; the coordinates are saved to
+        <span class="font-mono text-xs">auth_tbl_Settings</span> like every
+        other setting, so nothing has to be edited by hand.
+      </p>
+      <div id="dbError" class="hidden px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700"></div>
+      <div class="grid grid-cols-3 gap-3">
+        <div class="col-span-2">
+          <label class="block text-xs font-medium text-slate-500 mb-1">Host</label>
+          <input id="dbHost" type="text" required placeholder="mysql.internal"
+            class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-500 mb-1">Port</label>
+          <input id="dbPort" type="text" placeholder="3306"
+            class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-500 mb-1">User</label>
+          <input id="dbUser" type="text" required
+            class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-500 mb-1">Password</label>
+          <input id="dbPassword" type="password"
+            class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">Database</label>
+        <input id="dbName" type="text" required placeholder="identity_db"
+          class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+      </div>
+      <button type="submit"
+        class="w-full py-3 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-medium text-sm">
+        Connect &amp; create the schema
+      </button>
+      <p class="text-[11px] text-slate-400 text-center">
+        The connection is tested before anything is saved, and the schema is
+        applied straight away.
+      </p>
+    </form>
+
     <!-- Domain mismatch: the credentials worked, the domain did not match -->
     <div id="confirmPanel" class="hidden my-4 rounded-xl bg-blue-50 border border-blue-200 px-4 py-4">
       <p class="text-sm font-semibold text-blue-900 mb-1">Sign-in worked — one thing to confirm</p>
@@ -61,7 +109,7 @@
         Sign in with the OAuth provider of your organisation. If the account you
         verify with belongs to the domain you claim below, you become the Super
         System Admin and these values are saved to the shared
-        <span class="font-mono text-xs">oAuthConfig</span> settings table.
+        <span class="font-mono text-xs">auth_tbl_Settings</span> settings table.
       </p>
 
       <div>
@@ -289,19 +337,18 @@
       .then((r) => r.json())
       .then((s) => {
         if (!s.unclaimed) { location.href = '/'; return; }
-        // Both stores must work before a claim can be made: the settings go
-        // to NocoDB, and the claimer becomes the first user in id_db.
-        if (s.nocodb !== 'ok') {
-          showStoreProblem(
-            s.nocodbHint ||
-              'The NocoDB settings store is not available; set NOCODB_BASE_URL and ' +
-              "NOCODB_API_TOKEN in this app's environment first."
-          );
+        // The settings store answered — reaching this page at all proves it,
+        // since every other outcome is the 503 page with its own retry. So
+        // the only store left to ask about is the identity database.
+        if (s.database === 'unconfigured') {
+          // Not an error — just the step before this one. Collect the
+          // coordinates here rather than sending anyone to edit NocoDB.
+          document.getElementById('dbForm').classList.remove('hidden');
           return;
         }
         if (s.database !== 'ok') {
           showStoreProblem(
-            s.databaseHint || 'The identity database (id_db) is not available yet.'
+            s.databaseHint || 'The identity database is not reachable yet.'
           );
           return;
         }
@@ -346,6 +393,30 @@
         document.getElementById('form').classList.remove('hidden');
         refreshProviderUi();
       });
+
+    document.getElementById('dbForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('dbError');
+      err.classList.add('hidden');
+      const r = await fetch('/api/setup/database', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          host: document.getElementById('dbHost').value.trim(),
+          port: document.getElementById('dbPort').value.trim(),
+          user: document.getElementById('dbUser').value.trim(),
+          password: document.getElementById('dbPassword').value,
+          database: document.getElementById('dbName').value.trim(),
+        }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        err.textContent = data.error || 'Could not use that database.';
+        err.classList.remove('hidden');
+        return;
+      }
+      location.reload(); // on to the claim, with somewhere to record it
+    });
 
     document.getElementById('form').addEventListener('submit', (e) => {
       e.preventDefault();

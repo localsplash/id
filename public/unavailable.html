@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Settings unavailable</title>
+  <link rel="icon" href="/img/id-favicon.svg" type="image/svg+xml" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: { extend: { fontFamily: { sans: ['Inter','system-ui','sans-serif'] } } }
+    }
+  </script>
+</head>
+<body class="bg-gradient-to-br from-slate-100 to-amber-50 min-h-screen flex items-center justify-center p-4 font-sans">
+
+  <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-lg">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-11 h-11 rounded-xl bg-amber-500 flex items-center justify-center flex-shrink-0">
+        <svg class="w-6 h-6 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" d="M12 8v5M12 16.5v.5"/><circle cx="12" cy="12" r="9"/>
+        </svg>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold text-slate-800">This service cannot read its settings</h1>
+        <p class="text-xs text-slate-500">Nothing is wrong with your account — this is a configuration fault</p>
+      </div>
+    </div>
+
+    <p id="detail" class="px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-900 mb-4">
+      Checking…
+    </p>
+
+    <p class="text-sm text-slate-600 mb-2">
+      Every setting this service needs — the identity database, the trusted
+      network, the OAuth credentials — lives in the NocoDB base
+      <span class="font-mono text-xs" id="baseName">IdentityBase</span>, table
+      <span class="font-mono text-xs">auth_tbl_Settings</span>. The base is found
+      by <em>name</em>, so a renamed base looks exactly like a missing one.
+    </p>
+    <ul class="text-sm text-slate-600 list-disc pl-5 space-y-1 mb-5">
+      <li>Is NocoDB up, at the URL this service was given?</li>
+      <li>Does its API token still work, and can it see the base?</li>
+      <li>Is there exactly one base with that name — not zero, not two?</li>
+    </ul>
+
+    <div class="flex items-center gap-3">
+      <button id="retry"
+        class="py-2 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-medium text-sm">
+        Retry
+      </button>
+      <span id="status" class="text-xs text-slate-500"></span>
+    </div>
+    <p class="text-[11px] text-slate-400 mt-4">
+      Retrying re-detects the base from scratch — no restart is needed once the
+      base is back. A change made in NocoDB reaches this service within 30
+      seconds on its own.
+    </p>
+  </div>
+
+  <script>
+    const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
+      { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
+    ));
+
+    async function check(announce) {
+      const status = document.getElementById('status');
+      if (announce) status.textContent = 'Re-detecting…';
+      try {
+        const r = await fetch('/api/settings/health', { cache: 'no-store' });
+        const body = await r.json().catch(() => ({}));
+        if (body.base) document.getElementById('baseName').textContent = esc(body.base);
+        if (r.ok) {
+          status.textContent = 'Settings are readable again — reloading…';
+          location.href = '/';
+          return;
+        }
+        document.getElementById('detail').textContent =
+          body.error || 'The settings store did not answer.';
+        status.textContent = announce ? 'Still failing.' : '';
+      } catch {
+        document.getElementById('detail').textContent =
+          'This service did not answer the health check at all.';
+        status.textContent = '';
+      }
+    }
+
+    document.getElementById('retry').onclick = () => check(true);
+    check(false);
+  </script>
+</body>
+</html>

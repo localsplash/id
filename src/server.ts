@@ -2,53 +2,80 @@ import { buildApp } from './app';
 import { loadConfig } from './config';
 import { runMigrations } from './migrations';
 import { parseCidrList } from './net';
+import { SETTINGS_BASE_NAME, SETTINGS_TABLE_NAME, SettingsUnavailableError } from './settings';
 import { drainDeliveries } from './webhooks';
+
+const RETRY_DELAY_MS = 5_000;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main() {
   const config = loadConfig();
+  const { app, db, settingsStore } = buildApp();
 
-  // Network trust is security configuration: a malformed CIDR entry or an
-  // empty allowlist in a CIDR-mode production deployment must stop the
-  // process at startup, not fail requests ambiguously at runtime.
-  const appCidrs = parseCidrList(config.ID_TRUSTED_NETWORK);
-  parseCidrList(config.ID_TRUSTED_PROXY_CIDRS);
+  /**
+   * The settings store is not optional and there is no fallback: this app
+   * cannot know its own database, its trusted network, or its OAuth
+   * credentials without it. So the boot sequence is find-or-die — one retry
+   * for the ordinary case of NocoDB still coming up beside us, then exit
+   * with the reason rather than serving a instance that would answer every
+   * request with a fault it cannot explain.
+   */
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await settingsStore.bootstrap();
+      console.log(`[settings] ${SETTINGS_BASE_NAME}.${SETTINGS_TABLE_NAME} ready`);
+      // Seeded rows are empty on purpose: a table being created for the
+      // first time is not where a public URL or a domain gets invented. The
+      // setup wizard fills those in from the URL the first admin arrives on.
+      const pinned = settingsStore.overriddenKeys();
+      if (pinned.length) {
+        console.log(`[settings] overridden by the environment: ${pinned.join(', ')}`);
+      }
+      break;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (attempt === 1) {
+        console.warn(`[settings] ${message} — retrying once in ${RETRY_DELAY_MS / 1000}s`);
+        await sleep(RETRY_DELAY_MS);
+        continue;
+      }
+      console.error(`[settings] ${message}`);
+      console.error(
+        `[settings] Cannot start without the ${SETTINGS_BASE_NAME} base at ` +
+          `${config.NOCODB_BASE_URL}. Fix NOCODB_BASE_URL / NOCODB_API_TOKEN, or create ` +
+          `the base (its name must be unique), then start again.`
+      );
+      process.exit(1);
+    }
+  }
+
+  const settings = await settingsStore.getAll();
+
+  // Network trust is security configuration: a malformed CIDR entry, or an
+  // empty trustedCIDR in a production deployment that admits callers by
+  // network, must stop the process at startup rather than fail requests
+  // ambiguously at runtime.
+  const trusted = parseCidrList(settings.trustedCIDR ?? '');
+  parseCidrList(config.IDENTITY_TRUSTED_PROXY_CIDRS);
   if (
     config.NODE_ENV === 'production' &&
-    config.ID_APP_AUTH_MODE !== 'secret' &&
-    appCidrs.length === 0
+    config.IDENTITY_APP_AUTH_MODE !== 'secret' &&
+    trusted.length === 0
   ) {
     throw new Error(
-      `ID_APP_AUTH_MODE=${config.ID_APP_AUTH_MODE} requires ID_TRUSTED_NETWORK ` +
-        'to name the trusted network in production'
+      `IDENTITY_APP_AUTH_MODE=${config.IDENTITY_APP_AUTH_MODE} requires trustedCIDR in ` +
+        `${SETTINGS_BASE_NAME}.${SETTINGS_TABLE_NAME} to name the trusted network in production`
     );
   }
 
-  const { app, db, settingsStore } = buildApp();
-
-  // Best-effort: create/seed the oAuthConfig table in NocoDB. NocoDB may
-  // still be starting or the token may not exist yet — the app must come up
-  // regardless so the admin can bootstrap in any order.
-  try {
-    await settingsStore.bootstrap();
-    console.log('[settings] oAuthConfig table ready');
-    // Seeded rows are empty on purpose: a table being created for the first
-    // time is not where a public URL or a domain gets invented. The setup
-    // wizard fills those in from the URL the first admin arrives on.
-    const pinned = settingsStore.overriddenKeys();
-    if (pinned.length) {
-      console.log(`[settings] overridden by the environment: ${pinned.join(', ')}`);
-    }
-  } catch (err) {
-    console.warn(`[settings] NocoDB bootstrap failed (will retry on demand): ${String(err)}`);
-  }
-
-  // id_db schema — this repo is the sole owner; versioned, additive,
+  // The identity schema — this repo is the sole owner; versioned, additive,
   // recorded migrations (a second run is a no-op).
   //
   // The database coordinates are settings, so on a brand-new install they
-  // may not exist yet. That is a first-run state, not a crash: the app
-  // still listens, /setup says which store is missing, and the schema is
-  // applied by the ticker below as soon as the coordinates work.
+  // may not exist yet. That is a first-run state, not a crash: the app still
+  // listens, /setup collects the coordinates, and the schema is applied by
+  // the ticker below (or by the wizard itself) as soon as they work.
   let schemaReady = false;
   let lastSchemaError = '';
   const ensureSchema = async (): Promise<void> => {
@@ -98,11 +125,12 @@ async function main() {
   void tick();
 
   app.listen(config.PORT, () => {
-    console.log(`id listening on :${config.PORT}`);
+    console.log(`identity listening on :${config.PORT}`);
   });
 }
 
 main().catch((err) => {
-  console.error(err);
+  if (err instanceof SettingsUnavailableError) console.error(`[settings] ${err.message}`);
+  else console.error(err);
   process.exit(1);
 });
