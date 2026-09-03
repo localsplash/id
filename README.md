@@ -189,11 +189,18 @@ the **`IdentityBase`** base in NocoDB at `nocodb.X.TLD`.
 
 ### Naming
 
-| Thing | Rule | Here |
-| --- | --- | --- |
-| Public URL | `{repo}.X.TLD`, lowercase | `identity.X.TLD` |
-| NocoDB base | `{Repo}Base` | `IdentityBase` |
-| Settings table | `auth_tbl_Settings` | `auth_tbl_Settings` |
+| Thing | Here |
+| --- | --- |
+| Public URL | `identity.X.TLD` — lowercase repo name under the parent domain |
+| NocoDB base | `IdentityBase` |
+| Settings table | `auth_tbl_Settings` |
+
+`IdentityBase` is the only NocoDB base on the platform. The Echo applications
+keep their settings in the Echo database (`echo_tbl_Settings`), next to the
+data they describe; the one thing they read from here is `trustedCIDR`, which
+identity and every application have to agree on and which therefore has to
+live somewhere all of them can reach. A second base would be named for
+whatever it holds — and only if something genuinely needed one.
 
 The short form `id` is retired: it reads as "identifier" everywhere it
 appears, which is genuinely ambiguous in an application whose primary key is
@@ -239,7 +246,7 @@ base named `IdentityBase` exists:
 | Key | Purpose |
 | --- | --- |
 | `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | The MySQL database this app owns and migrates itself. Collected by the first-run wizard; a change takes a restart |
-| `trustedCIDR` | **One value for the whole platform** — the network the servers sit on. Every application reads this same key rather than spelling the same network under its own name |
+| `trustedCIDR` | **One value for the whole platform** — the network the servers sit on. Identity and every Echo application read this same key rather than spelling the same network under its own name; it is the only row the Echo apps read from this base |
 | `PARENT_DOMAIN` | Apex domain (`X.TLD`) the **apps** are served from; drives the cookie scope and redirect allowlist, and is the default super-admin domain |
 | `APP_BASE_URL` | Public base URL, e.g. `https://identity.X.TLD`. Normally left to the wizard — see *Where this service thinks it lives* below |
 | `IDENTITY_CLIENT_SECRET` | **Legacy (rollout only)** — shared secret apps present at `/api/token` when `IDENTITY_APP_AUTH_MODE` is `secret`/`dual`; ignored in the default `cidr` mode |
